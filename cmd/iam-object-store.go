@@ -22,7 +22,6 @@ import (
 	"path"
 	"strings"
 	"sync"
-	"time"
 	"unicode/utf8"
 
 	jsoniter "github.com/json-iterator/go"
@@ -30,35 +29,48 @@ import (
 	"github.com/minio/minio/internal/config"
 	"github.com/minio/minio/internal/kms"
 	"github.com/minio/minio/internal/logger"
-	iampolicy "github.com/minio/pkg/iam/policy"
 )
 
 // IAMObjectStore implements IAMStorageAPI
 type IAMObjectStore struct {
-	// Protect assignment to objAPI
+	// Protect access to storage within the current server.
 	sync.RWMutex
+
+	*iamCache
+
+	usersSysType UsersSysType
 
 	objAPI ObjectLayer
 }
 
-func newIAMObjectStore(objAPI ObjectLayer) *IAMObjectStore {
-	return &IAMObjectStore{objAPI: objAPI}
+func newIAMObjectStore(objAPI ObjectLayer, usersSysType UsersSysType) *IAMObjectStore {
+	return &IAMObjectStore{
+		iamCache:     newIamCache(),
+		objAPI:       objAPI,
+		usersSysType: usersSysType,
+	}
 }
 
-func (iamOS *IAMObjectStore) lock() {
+func (iamOS *IAMObjectStore) rlock() *iamCache {
+	iamOS.RLock()
+	return iamOS.iamCache
+}
+
+func (iamOS *IAMObjectStore) runlock() {
+	iamOS.RUnlock()
+}
+
+func (iamOS *IAMObjectStore) lock() *iamCache {
 	iamOS.Lock()
+	return iamOS.iamCache
 }
 
 func (iamOS *IAMObjectStore) unlock() {
 	iamOS.Unlock()
 }
 
-func (iamOS *IAMObjectStore) rlock() {
-	iamOS.RLock()
-}
-
-func (iamOS *IAMObjectStore) runlock() {
-	iamOS.RUnlock()
+func (iamOS *IAMObjectStore) getUsersSysType() UsersSysType {
+	return iamOS.usersSysType
 }
 
 // Migrate users directory in a single scan.
@@ -116,7 +128,7 @@ func (iamOS *IAMObjectStore) migrateUsersConfigToV1(ctx context.Context) error {
 	next:
 		// 4. check if user identity has old format.
 		identityPath := pathJoin(basePrefix, user, iamIdentityFile)
-		var cred = auth.Credentials{
+		cred := auth.Credentials{
 			AccessKey: user,
 		}
 		if err := iamOS.loadIAMConfig(ctx, &cred, identityPath); err != nil {
@@ -147,7 +159,6 @@ func (iamOS *IAMObjectStore) migrateUsersConfigToV1(ctx context.Context) error {
 		// has not changed.
 	}
 	return nil
-
 }
 
 func (iamOS *IAMObjectStore) migrateToV1(ctx context.Context) error {
@@ -183,11 +194,13 @@ func (iamOS *IAMObjectStore) migrateToV1(ctx context.Context) error {
 
 // Should be called under config migration lock
 func (iamOS *IAMObjectStore) migrateBackendFormat(ctx context.Context) error {
+	iamOS.Lock()
+	defer iamOS.Unlock()
 	return iamOS.migrateToV1(ctx)
 }
 
 func (iamOS *IAMObjectStore) saveIAMConfig(ctx context.Context, item interface{}, objPath string, opts ...options) error {
-	var json = jsoniter.ConfigCompatibleWithStandardLibrary
+	json := jsoniter.ConfigCompatibleWithStandardLibrary
 	data, err := json.Marshal(item)
 	if err != nil {
 		return err
@@ -203,20 +216,28 @@ func (iamOS *IAMObjectStore) saveIAMConfig(ctx context.Context, item interface{}
 	return saveConfig(ctx, iamOS.objAPI, objPath, data)
 }
 
-func (iamOS *IAMObjectStore) loadIAMConfig(ctx context.Context, item interface{}, objPath string) error {
-	data, err := readConfig(ctx, iamOS.objAPI, objPath)
+func (iamOS *IAMObjectStore) loadIAMConfigBytesWithMetadata(ctx context.Context, objPath string) ([]byte, ObjectInfo, error) {
+	data, meta, err := readConfigWithMetadata(ctx, iamOS.objAPI, objPath)
 	if err != nil {
-		return err
+		return nil, meta, err
 	}
 	if !utf8.Valid(data) && GlobalKMS != nil {
 		data, err = config.DecryptBytes(GlobalKMS, data, kms.Context{
 			minioMetaBucket: path.Join(minioMetaBucket, objPath),
 		})
 		if err != nil {
-			return err
+			return nil, meta, err
 		}
 	}
-	var json = jsoniter.ConfigCompatibleWithStandardLibrary
+	return data, meta, nil
+}
+
+func (iamOS *IAMObjectStore) loadIAMConfig(ctx context.Context, item interface{}, objPath string) error {
+	data, _, err := iamOS.loadIAMConfigBytesWithMetadata(ctx, objPath)
+	if err != nil {
+		return err
+	}
+	json := jsoniter.ConfigCompatibleWithStandardLibrary
 	return json.Unmarshal(data, item)
 }
 
@@ -224,20 +245,34 @@ func (iamOS *IAMObjectStore) deleteIAMConfig(ctx context.Context, path string) e
 	return deleteConfig(ctx, iamOS.objAPI, path)
 }
 
-func (iamOS *IAMObjectStore) loadPolicyDoc(ctx context.Context, policy string, m map[string]iampolicy.Policy) error {
-	var p iampolicy.Policy
-	err := iamOS.loadIAMConfig(ctx, &p, getPolicyDocPath(policy))
+func (iamOS *IAMObjectStore) loadPolicyDoc(ctx context.Context, policy string, m map[string]PolicyDoc) error {
+	data, objInfo, err := iamOS.loadIAMConfigBytesWithMetadata(ctx, getPolicyDocPath(policy))
 	if err != nil {
 		if err == errConfigNotFound {
 			return errNoSuchPolicy
 		}
 		return err
 	}
+
+	var p PolicyDoc
+	err = p.parseJSON(data)
+	if err != nil {
+		return err
+	}
+
+	if p.Version == 0 {
+		// This means that policy was in the old version (without any
+		// timestamp info). We fetch the mod time of the file and save
+		// that as create and update date.
+		p.CreateDate = objInfo.ModTime
+		p.UpdateDate = objInfo.ModTime
+	}
+
 	m[policy] = p
 	return nil
 }
 
-func (iamOS *IAMObjectStore) loadPolicyDocs(ctx context.Context, m map[string]iampolicy.Policy) error {
+func (iamOS *IAMObjectStore) loadPolicyDocs(ctx context.Context, m map[string]PolicyDoc) error {
 	for item := range listIAMConfigItems(ctx, iamOS.objAPI, iamConfigPoliciesPrefix) {
 		if item.Err != nil {
 			return item.Err
@@ -328,8 +363,8 @@ func (iamOS *IAMObjectStore) loadGroups(ctx context.Context, m map[string]GroupI
 }
 
 func (iamOS *IAMObjectStore) loadMappedPolicy(ctx context.Context, name string, userType IAMUserType, isGroup bool,
-	m map[string]MappedPolicy) error {
-
+	m map[string]MappedPolicy,
+) error {
 	var p MappedPolicy
 	err := iamOS.loadIAMConfig(ctx, &p, getMappedPolicyPath(name, userType, isGroup))
 	if err != nil {
@@ -370,12 +405,7 @@ func (iamOS *IAMObjectStore) loadMappedPolicies(ctx context.Context, userType IA
 	return nil
 }
 
-// Refresh IAMSys. If an object layer is passed in use that, otherwise load from global.
-func (iamOS *IAMObjectStore) loadAll(ctx context.Context, sys *IAMSys) error {
-	return sys.Load(ctx, iamOS)
-}
-
-func (iamOS *IAMObjectStore) savePolicyDoc(ctx context.Context, policyName string, p iampolicy.Policy) error {
+func (iamOS *IAMObjectStore) savePolicyDoc(ctx context.Context, policyName string, p PolicyDoc) error {
 	return iamOS.saveIAMConfig(ctx, &p, getPolicyDocPath(policyName))
 }
 
@@ -462,14 +492,4 @@ func listIAMConfigItems(ctx context.Context, objAPI ObjectLayer, pathPrefix stri
 	}()
 
 	return ch
-}
-
-func (iamOS *IAMObjectStore) watch(ctx context.Context, sys *IAMSys) {
-	// Refresh IAMSys.
-	for {
-		time.Sleep(globalRefreshIAMInterval)
-		if err := iamOS.loadAll(ctx, sys); err != nil {
-			logger.LogIf(ctx, err)
-		}
-	}
 }

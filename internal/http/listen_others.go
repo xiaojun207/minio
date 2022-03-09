@@ -1,3 +1,4 @@
+//go:build windows || plan9 || solaris
 // +build windows plan9 solaris
 
 // Copyright (c) 2015-2021 MinIO, Inc.
@@ -22,5 +23,4 @@ package http
 import "net"
 
 // Windows, plan9 specific listener.
-var listen = net.Listen
-var fallbackListen = net.Listen
+var listenCfg = net.ListenConfig{}

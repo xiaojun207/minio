@@ -24,8 +24,11 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"sync/atomic"
 	"time"
 
+	"github.com/klauspost/compress/gzhttp"
+	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/logger/message/audit"
 )
 
@@ -144,8 +147,8 @@ func GetAuditEntry(ctx context.Context) *audit.Entry {
 		}
 		r = &audit.Entry{
 			Version:      audit.Version,
-			DeploymentID: globalDeploymentID,
-			Time:         time.Now().UTC().Format(time.RFC3339Nano),
+			DeploymentID: xhttp.GlobalDeploymentID,
+			Time:         time.Now().UTC(),
 		}
 		SetAuditEntry(ctx, r)
 		return r
@@ -156,7 +159,7 @@ func GetAuditEntry(ctx context.Context) *audit.Entry {
 // AuditLog - logs audit logs to all audit targets.
 func AuditLog(ctx context.Context, w http.ResponseWriter, r *http.Request, reqClaims map[string]interface{}, filterKeys ...string) {
 	// Fast exit if there is not audit target configured
-	if len(AuditTargets) == 0 {
+	if atomic.LoadInt32(&nAuditTargets) == 0 {
 		return
 	}
 
@@ -168,7 +171,7 @@ func AuditLog(ctx context.Context, w http.ResponseWriter, r *http.Request, reqCl
 			return
 		}
 
-		entry = audit.ToEntry(w, r, reqClaims, globalDeploymentID)
+		entry = audit.ToEntry(w, r, reqClaims, xhttp.GlobalDeploymentID)
 		// indicates all requests for this API call are inbound
 		entry.Trigger = "incoming"
 
@@ -183,20 +186,40 @@ func AuditLog(ctx context.Context, w http.ResponseWriter, r *http.Request, reqCl
 			statusCode      int
 			timeToResponse  time.Duration
 			timeToFirstByte time.Duration
+			outputBytes     int64 = -1 // -1: unknown output bytes
 		)
 
-		st, ok := w.(*ResponseWriter)
-		if ok {
+		var st *ResponseWriter
+		switch v := w.(type) {
+		case *ResponseWriter:
+			st = v
+		case *gzhttp.GzipResponseWriter:
+			// the writer may be obscured by gzip response writer
+			if rw, ok := v.ResponseWriter.(*ResponseWriter); ok {
+				st = rw
+			}
+		}
+		if st != nil {
 			statusCode = st.StatusCode
 			timeToResponse = time.Now().UTC().Sub(st.StartTime)
 			timeToFirstByte = st.TimeToFirstByte
+			outputBytes = int64(st.Size())
 		}
 
 		entry.API.Name = reqInfo.API
 		entry.API.Bucket = reqInfo.BucketName
 		entry.API.Object = reqInfo.ObjectName
+		entry.API.Objects = make([]audit.ObjectVersion, 0, len(reqInfo.Objects))
+		for _, ov := range reqInfo.Objects {
+			entry.API.Objects = append(entry.API.Objects, audit.ObjectVersion{
+				ObjectName: ov.ObjectName,
+				VersionID:  ov.VersionID,
+			})
+		}
 		entry.API.Status = http.StatusText(statusCode)
 		entry.API.StatusCode = statusCode
+		entry.API.InputBytes = r.ContentLength
+		entry.API.OutputBytes = outputBytes
 		entry.API.TimeToResponse = strconv.FormatInt(timeToResponse.Nanoseconds(), 10) + "ns"
 		entry.Tags = reqInfo.GetTagsMap()
 		// ttfb will be recorded only for GET requests, Ignore such cases where ttfb will be empty.
@@ -211,7 +234,9 @@ func AuditLog(ctx context.Context, w http.ResponseWriter, r *http.Request, reqCl
 	}
 
 	// Send audit logs only to http targets.
-	for _, t := range AuditTargets {
-		_ = t.Send(entry, string(All))
+	for _, t := range AuditTargets() {
+		if err := t.Send(entry, string(All)); err != nil {
+			LogAlwaysIf(context.Background(), fmt.Errorf("event(%v) was not sent to Audit target (%v): %v", entry, t, err), All)
+		}
 	}
 }

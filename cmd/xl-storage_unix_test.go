@@ -1,3 +1,4 @@
+//go:build linux || darwin || dragonfly || freebsd || netbsd || openbsd
 // +build linux darwin dragonfly freebsd netbsd openbsd
 
 // Copyright (c) 2015-2021 MinIO, Inc.
@@ -70,7 +71,7 @@ func TestIsValidUmaskVol(t *testing.T) {
 	}
 
 	// Get umask of the bits stored.
-	currentUmask := 0777 - uint32(st.Mode().Perm())
+	currentUmask := 0o777 - uint32(st.Mode().Perm())
 
 	// Verify if umask is correct.
 	if int(currentUmask) != testCase.expectedUmask {
@@ -113,7 +114,7 @@ func TestIsValidUmaskFile(t *testing.T) {
 	}
 
 	// CheckFile - stat the file.
-	if _, err := disk.StatInfoFile(context.Background(), testCase.volName, "hello-world.txt/"+xlStorageFormatFile); err != nil {
+	if _, err := disk.StatInfoFile(context.Background(), testCase.volName, "hello-world.txt/"+xlStorageFormatFile, false); err != nil {
 		t.Fatalf("Stat failed with %s expected to pass.", err)
 	}
 }

@@ -61,7 +61,7 @@ func TestJSONQueries(t *testing.T) {
 	{"id": 2,"title": "Second Record","desc": "another text","numbers": [2, 3.0, 4]}
 	{"id": 3,"title": "Second Record","desc": "another text","nested": [[2, 3.0, 4], [7, 8.5, 9]]}`
 
-	var testTable = []struct {
+	testTable := []struct {
 		name       string
 		query      string
 		requestXML []byte // override request XML
@@ -100,14 +100,16 @@ func TestJSONQueries(t *testing.T) {
 			wantResult: `{"id":0}
 {"id":1}
 {"id":2}
-{"id":3}`},
+{"id":3}`,
+		},
 		{
 			name:  "bignum-2",
 			query: `SELECT id from s3object s WHERE s.id >= -9223372036854775808`,
 			wantResult: `{"id":0}
 {"id":1}
 {"id":2}
-{"id":3}`},
+{"id":3}`,
+		},
 		{
 			name:       "donatello-3",
 			query:      `SELECT * from s3object s WHERE 'value' IN s.synonyms[*]`,
@@ -404,6 +406,164 @@ func TestJSONQueries(t *testing.T) {
 			query:      `SELECT 3.0 / 2, 5 / 2.0 FROM S3Object LIMIT 1`,
 			wantResult: `{"_1":1.5,"_2":2.5}`,
 		},
+		{
+			name:  "limit-1",
+			query: `SELECT * FROM S3Object[*].elements[*] LIMIT 1`,
+			requestXML: []byte(`
+<?xml version="1.0" encoding="UTF-8"?>
+<SelectObjectContentRequest>
+    <Expression>select * from s3object[*].elements[*] s where s.element_type = '__elem__merfu'</Expression>
+    <ExpressionType>SQL</ExpressionType>
+    <InputSerialization>
+        <CompressionType>NONE</CompressionType>
+        <JSON>
+            <Type>DOCUMENT</Type>
+        </JSON>
+    </InputSerialization>
+    <OutputSerialization>
+        <JSON>
+        </JSON>
+    </OutputSerialization>
+    <RequestProgress>
+        <Enabled>FALSE</Enabled>
+    </RequestProgress>
+</SelectObjectContentRequest>`),
+			wantResult: `{"element_type":"__elem__merfu","element_id":"d868aefe-ef9a-4be2-b9b2-c9fd89cc43eb","attributes":{"__attr__image_dpi":300,"__attr__image_size":[2550,3299],"__attr__image_index":2,"__attr__image_format":"JPEG","__attr__file_extension":"jpg","__attr__data":null}}`,
+			withJSON: `
+{
+  "name": "small_pdf1.pdf",
+  "lume_id": "9507193e-572d-4f95-bcf1-e9226d96be65",
+  "elements": [
+    {
+      "element_type": "__elem__image",
+      "element_id": "859d09c4-7cf1-4a37-9674-3a7de8b56abc",
+      "attributes": {
+        "__attr__image_dpi": 300,
+        "__attr__image_size": [
+          2550,
+          3299
+        ],
+        "__attr__image_index": 1,
+        "__attr__image_format": "JPEG",
+        "__attr__file_extension": "jpg",
+        "__attr__data": null
+      }
+    },
+    {
+      "element_type": "__elem__merfu",
+      "element_id": "d868aefe-ef9a-4be2-b9b2-c9fd89cc43eb",
+      "attributes": {
+        "__attr__image_dpi": 300,
+        "__attr__image_size": [
+          2550,
+          3299
+        ],
+        "__attr__image_index": 2,
+        "__attr__image_format": "JPEG",
+        "__attr__file_extension": "jpg",
+        "__attr__data": null
+      }
+    }
+  ],
+  "data": "asdascasdc1234e123erdasdas"
+}`,
+		},
+		{
+			name:       "limit-2",
+			query:      `select * from s3object[*].person[*] limit 1`,
+			wantResult: `{"Id":1,"Name":"Anshu","Address":"Templestowe","Car":"Jeep"}`,
+			withJSON:   `{ "person": [ { "Id": 1, "Name": "Anshu", "Address": "Templestowe", "Car": "Jeep" }, { "Id": 2, "Name": "Ben Mostafa", "Address": "Las Vegas", "Car": "Mustang" }, { "Id": 3, "Name": "Rohan Wood", "Address": "Wooddon", "Car": "VW" } ] }`,
+		},
+		{
+			name:       "lower-case-is",
+			query:      `select * from s3object[*] as s where s.request.header['User-Agent'] is not null`,
+			wantResult: `{"request":{"uri":"/1","header":{"User-Agent":"test"}}}`,
+			withJSON: `{"request":{"uri":"/1","header":{"User-Agent":"test"}}}
+{"request":{"uri":"/2","header":{}}}`,
+		},
+		{
+			name:       "is-not-missing",
+			query:      `select * from s3object[*] as s where s.request.header['User-Agent'] is not missing`,
+			wantResult: `{"request":{"uri":"/1","header":{"User-Agent":"test"}}}`,
+			withJSON: `{"request":{"uri":"/1","header":{"User-Agent":"test"}}}
+{"request":{"uri":"/2","header":{}}}`,
+		},
+		{
+			name:  "is-not-missing-2",
+			query: `select * from s3object[*] as s where s.request.header is not missing`,
+			wantResult: `{"request":{"uri":"/1","header":{"User-Agent":"test"}}}
+{"request":{"uri":"/2","header":{}}}`,
+			withJSON: `{"request":{"uri":"/1","header":{"User-Agent":"test"}}}
+{"request":{"uri":"/2","header":{}}}`,
+		},
+		{
+			name:  "is-not-missing-null",
+			query: `select * from s3object[*] as s where s.request.header is not missing`,
+			wantResult: `{"request":{"uri":"/1","header":{"User-Agent":"test"}}}
+{"request":{"uri":"/2","header":null}}`,
+			withJSON: `{"request":{"uri":"/1","header":{"User-Agent":"test"}}}
+{"request":{"uri":"/2","header":null}}`,
+		},
+		{
+			name:       "is-not-missing",
+			query:      `select * from s3object[*] as s where s.request.header['User-Agent'] is not missing`,
+			wantResult: `{"request":{"uri":"/1","header":{"User-Agent":"test"}}}`,
+			withJSON: `{"request":{"uri":"/1","header":{"User-Agent":"test"}}}
+{"request":{"uri":"/2","header":{}}}`,
+		},
+		{
+			name:  "is-not-missing-2",
+			query: `select * from s3object[*] as s where s.request.header is not missing`,
+			wantResult: `{"request":{"uri":"/1","header":{"User-Agent":"test"}}}
+{"request":{"uri":"/2","header":{}}}`,
+			withJSON: `{"request":{"uri":"/1","header":{"User-Agent":"test"}}}
+{"request":{"uri":"/2","header":{}}}`,
+		},
+		{
+			name:  "is-not-missing-null",
+			query: `select * from s3object[*] as s where s.request.header is not missing`,
+			wantResult: `{"request":{"uri":"/1","header":{"User-Agent":"test"}}}
+{"request":{"uri":"/2","header":null}}`,
+			withJSON: `{"request":{"uri":"/1","header":{"User-Agent":"test"}}}
+{"request":{"uri":"/2","header":null}}`,
+		},
+
+		{
+			name:       "is-missing",
+			query:      `select * from s3object[*] as s where s.request.header['User-Agent'] is missing`,
+			wantResult: `{"request":{"uri":"/2","header":{}}}`,
+			withJSON: `{"request":{"uri":"/1","header":{"User-Agent":"test"}}}
+{"request":{"uri":"/2","header":{}}}`,
+		},
+		{
+			name:       "is-missing-2",
+			query:      `select * from s3object[*] as s where s.request.header is missing`,
+			wantResult: ``,
+			withJSON: `{"request":{"uri":"/1","header":{"User-Agent":"test"}}}
+{"request":{"uri":"/2","header":{}}}`,
+		},
+		{
+			name:       "is-missing",
+			query:      `select * from s3object[*] as s where s.request.header['User-Agent'] = missing`,
+			wantResult: `{"request":{"uri":"/2","header":{}}}`,
+			withJSON: `{"request":{"uri":"/1","header":{"User-Agent":"test"}}}
+{"request":{"uri":"/2","header":{}}}`,
+		},
+		{
+			name:       "is-missing-null",
+			query:      `select * from s3object[*] as s where s.request.header is missing`,
+			wantResult: ``,
+			withJSON: `{"request":{"uri":"/1","header":{"User-Agent":"test"}}}
+{"request":{"uri":"/2","header":null}}`,
+		},
+		{
+			name:  "is-missing-select",
+			query: `select s.request.header['User-Agent'] as h from s3object[*] as s`,
+			wantResult: `{"h":"test"}
+{}`,
+			withJSON: `{"request":{"uri":"/1","header":{"User-Agent":"test"}}}
+{"request":{"uri":"/2","header":{}}}`,
+		},
 	}
 
 	defRequest := `<?xml version="1.0" encoding="UTF-8"?>
@@ -535,7 +695,7 @@ func TestCSVQueries(t *testing.T) {
 	input := `index,ID,CaseNumber,Date,Day,Month,Year,Block,IUCR,PrimaryType,Description,LocationDescription,Arrest,Domestic,Beat,District,Ward,CommunityArea,FBI Code,XCoordinate,YCoordinate,UpdatedOn,Latitude,Longitude,Location
 2700763,7732229,,2010-05-26 00:00:00,26,May,2010,113XX S HALSTED ST,1150,,CREDIT CARD FRAUD,,False,False,2233,22.0,34.0,,11,,,,41.688043288,-87.6422444,"(41.688043288, -87.6422444)"`
 
-	var testTable = []struct {
+	testTable := []struct {
 		name       string
 		query      string
 		requestXML []byte
@@ -615,65 +775,124 @@ func TestCSVQueries(t *testing.T) {
 }
 
 func TestCSVQueries2(t *testing.T) {
-	input := `id,time,num,num2,text
+	testInput := []byte(`id,time,num,num2,text
 1,2010-01-01T,7867786,4565.908123,"a text, with comma"
 2,2017-01-02T03:04Z,-5, 0.765111,
-`
-	var testTable = []struct {
+`)
+	testTable := []struct {
 		name       string
 		query      string
+		input      []byte
 		requestXML []byte // override request XML
 		wantResult string
 	}{
 		{
 			name:       "select-all",
+			input:      testInput,
 			query:      `SELECT * from s3object AS s WHERE id = '1'`,
 			wantResult: `{"id":"1","time":"2010-01-01T","num":"7867786","num2":"4565.908123","text":"a text, with comma"}`,
 		},
 		{
 			name:       "select-all-2",
+			input:      testInput,
 			query:      `SELECT * from s3object s WHERE id = 2`,
 			wantResult: `{"id":"2","time":"2017-01-02T03:04Z","num":"-5","num2":" 0.765111","text":""}`,
 		},
 		{
 			name:       "select-text-convert",
+			input:      testInput,
 			query:      `SELECT CAST(text AS STRING) AS text from s3object s WHERE id = 1`,
 			wantResult: `{"text":"a text, with comma"}`,
 		},
 		{
 			name:       "select-text-direct",
+			input:      testInput,
 			query:      `SELECT text from s3object s WHERE id = 1`,
 			wantResult: `{"text":"a text, with comma"}`,
 		},
 		{
 			name:       "select-time-direct",
+			input:      testInput,
 			query:      `SELECT time from s3object s WHERE id = 2`,
 			wantResult: `{"time":"2017-01-02T03:04Z"}`,
 		},
 		{
 			name:       "select-int-direct",
+			input:      testInput,
 			query:      `SELECT num from s3object s WHERE id = 2`,
 			wantResult: `{"num":"-5"}`,
 		},
 		{
 			name:       "select-float-direct",
+			input:      testInput,
 			query:      `SELECT num2 from s3object s WHERE id = 2`,
 			wantResult: `{"num2":" 0.765111"}`,
 		},
 		{
 			name:       "select-in-array",
+			input:      testInput,
 			query:      `select id from S3Object s WHERE id in [1,3]`,
 			wantResult: `{"id":"1"}`,
 		},
 		{
 			name:       "select-in-array-matchnone",
+			input:      testInput,
 			query:      `select id from S3Object s WHERE s.id in [4,3]`,
 			wantResult: ``,
 		},
 		{
 			name:       "select-float-by-val",
+			input:      testInput,
 			query:      `SELECT num2 from s3object s WHERE num2 = 0.765111`,
 			wantResult: `{"num2":" 0.765111"}`,
+		},
+		{
+			name:       "select-non_exiting_values",
+			input:      testInput,
+			query:      `SELECT _1 as first, s._100 from s3object s LIMIT 1`,
+			wantResult: `{"first":"1","_100":null}`,
+		},
+		{
+			name:       "select-is_null_noresults",
+			input:      testInput,
+			query:      `select _2 from S3object where _2 IS NULL`,
+			wantResult: ``,
+		},
+		{
+			name:  "select-is_null_results",
+			input: testInput,
+			query: `select _2 from S3object WHERE _100 IS NULL`,
+			wantResult: `{"_2":"2010-01-01T"}
+{"_2":"2017-01-02T03:04Z"}`,
+		},
+		{
+			name:  "select-is_not_null_results",
+			input: testInput,
+			query: `select _2 from S3object where _2 IS NOT NULL`,
+			wantResult: `{"_2":"2010-01-01T"}
+{"_2":"2017-01-02T03:04Z"}`,
+		},
+		{
+			name:       "select-is_not_null_noresults",
+			input:      testInput,
+			query:      `select _2 from S3object WHERE _100 IS NOT NULL`,
+			wantResult: ``,
+		},
+		{
+			name: "select-is_not_string",
+			input: []byte(`c1,c2,c3
+1,2,3
+1,,3`),
+			query:      `select * from S3object where _2 IS NOT ''`,
+			wantResult: `{"c1":"1","c2":"2","c3":"3"}`,
+		},
+		{
+			name: "select-is_not_string",
+			input: []byte(`c1,c2,c3
+1,2,3
+1,,3`),
+			query:      `select * from S3object where _2 != '' AND _2 > 1`,
+			wantResult: `{"c1":"1","c2":"2","c3":"3"}`,
 		},
 	}
 
@@ -709,7 +928,7 @@ func TestCSVQueries2(t *testing.T) {
 			}
 
 			if err = s3Select.Open(func(offset, length int64) (io.ReadCloser, error) {
-				return ioutil.NopCloser(bytes.NewBufferString(input)), nil
+				return ioutil.NopCloser(bytes.NewBuffer(testCase.input)), nil
 			}); err != nil {
 				t.Fatal(err)
 			}
@@ -745,7 +964,7 @@ func TestCSVQueries3(t *testing.T) {
 apple,1,true
 mango,3,false
 `
-	var testTable = []struct {
+	testTable := []struct {
 		name       string
 		query      string
 		requestXML []byte // override request XML
@@ -887,7 +1106,7 @@ true`,
 }
 
 func TestCSVInput(t *testing.T) {
-	var testTable = []struct {
+	testTable := []struct {
 		requestXML     []byte
 		expectedResult []byte
 	}{
@@ -987,7 +1206,7 @@ func TestCSVInput(t *testing.T) {
 		},
 	}
 
-	var csvData = []byte(`one,two,three
+	csvData := []byte(`one,two,three
 -1,foo,true
 ,bar,false
 2.5,baz,true
@@ -1031,12 +1250,10 @@ func TestCSVInput(t *testing.T) {
 			}
 		})
 	}
-
 }
 
 func TestJSONInput(t *testing.T) {
-
-	var testTable = []struct {
+	testTable := []struct {
 		requestXML     []byte
 		expectedResult []byte
 	}{
@@ -1112,7 +1329,7 @@ func TestJSONInput(t *testing.T) {
 		},
 	}
 
-	var jsonData = []byte(`{"three":true,"two":"foo","one":-1}
+	jsonData := []byte(`{"three":true,"two":"foo","one":-1}
 {"three":false,"two":"bar","one":null}
 {"three":true,"two":"baz","one":2.5}
 `)
@@ -1161,7 +1378,7 @@ func TestParquetInput(t *testing.T) {
 	os.Setenv("MINIO_API_SELECT_PARQUET", "on")
 	defer os.Setenv("MINIO_API_SELECT_PARQUET", "off")
 
-	var testTable = []struct {
+	testTable := []struct {
 		requestXML     []byte
 		expectedResult []byte
 	}{
@@ -1278,7 +1495,7 @@ func TestParquetInputSchema(t *testing.T) {
 	os.Setenv("MINIO_API_SELECT_PARQUET", "on")
 	defer os.Setenv("MINIO_API_SELECT_PARQUET", "off")
 
-	var testTable = []struct {
+	testTable := []struct {
 		requestXML []byte
 		wantResult string
 	}{
@@ -1390,7 +1607,6 @@ func TestParquetInputSchema(t *testing.T) {
 			if !reflect.DeepEqual(gotS, testCase.wantResult) {
 				t.Errorf("received response does not match with expected reply. Query: %s\ngot: %s\nwant:%s", testCase.requestXML, gotS, testCase.wantResult)
 			}
-
 		})
 	}
 }
@@ -1399,7 +1615,7 @@ func TestParquetInputSchemaCSV(t *testing.T) {
 	os.Setenv("MINIO_API_SELECT_PARQUET", "on")
 	defer os.Setenv("MINIO_API_SELECT_PARQUET", "off")
 
-	var testTable = []struct {
+	testTable := []struct {
 		requestXML []byte
 		wantResult string
 	}{
@@ -1509,7 +1725,6 @@ func TestParquetInputSchemaCSV(t *testing.T) {
 			if !reflect.DeepEqual(gotS, testCase.wantResult) {
 				t.Errorf("received response does not match with expected reply. Query: %s\ngot: %s\nwant:%s", testCase.requestXML, gotS, testCase.wantResult)
 			}
-
 		})
 	}
 }

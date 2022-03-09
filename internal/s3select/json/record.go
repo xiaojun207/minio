@@ -89,6 +89,8 @@ func (r *Record) Set(name string, value *sql.Value) (sql.Record, error) {
 		v = s
 	} else if value.IsNull() {
 		v = nil
+	} else if value.IsMissing() {
+		return r, nil
 	} else if b, ok := value.ToBytes(); ok {
 		// This can either be raw json or a CSV value.
 		// Only treat objects and arrays as JSON.
@@ -103,7 +105,7 @@ func (r *Record) Set(name string, value *sql.Value) (sql.Record, error) {
 		return nil, fmt.Errorf("unsupported sql value %v and type %v", value, value.GetTypeString())
 	}
 
-	name = strings.Replace(name, "*", "__ALL__", -1)
+	name = strings.ReplaceAll(name, "*", "__ALL__")
 	r.KVS = append(r.KVS, jstream.KV{Key: name, Value: v})
 	return r, nil
 }

@@ -24,14 +24,15 @@ import (
 
 // NoncurrentVersionExpiration - an action for lifecycle configuration rule.
 type NoncurrentVersionExpiration struct {
-	XMLName        xml.Name       `xml:"NoncurrentVersionExpiration"`
-	NoncurrentDays ExpirationDays `xml:"NoncurrentDays,omitempty"`
-	set            bool
+	XMLName                 xml.Name       `xml:"NoncurrentVersionExpiration"`
+	NoncurrentDays          ExpirationDays `xml:"NoncurrentDays,omitempty"`
+	NewerNoncurrentVersions int            `xml:"NewerNoncurrentVersions,omitempty"`
+	set                     bool
 }
 
 // MarshalXML if non-current days not set to non zero value
 func (n NoncurrentVersionExpiration) MarshalXML(e *xml.Encoder, start xml.StartElement) error {
-	if n.IsDaysNull() {
+	if n.IsNull() {
 		return nil
 	}
 	type noncurrentVersionExpirationWrapper NoncurrentVersionExpiration
@@ -40,15 +41,35 @@ func (n NoncurrentVersionExpiration) MarshalXML(e *xml.Encoder, start xml.StartE
 
 // UnmarshalXML decodes NoncurrentVersionExpiration
 func (n *NoncurrentVersionExpiration) UnmarshalXML(d *xml.Decoder, startElement xml.StartElement) error {
-	type noncurrentVersionExpirationWrapper NoncurrentVersionExpiration
-	var val noncurrentVersionExpirationWrapper
+	// To handle xml with MaxNoncurrentVersions from older MinIO releases.
+	// note: only one of MaxNoncurrentVersions or NewerNoncurrentVersions would be present.
+	type noncurrentExpiration struct {
+		XMLName                 xml.Name       `xml:"NoncurrentVersionExpiration"`
+		NoncurrentDays          ExpirationDays `xml:"NoncurrentDays,omitempty"`
+		NewerNoncurrentVersions int            `xml:"NewerNoncurrentVersions,omitempty"`
+		MaxNoncurrentVersions   int            `xml:"MaxNoncurrentVersions,omitempty"`
+	}
+
+	var val noncurrentExpiration
 	err := d.DecodeElement(&val, &startElement)
 	if err != nil {
 		return err
 	}
-	*n = NoncurrentVersionExpiration(val)
+	if val.MaxNoncurrentVersions > 0 {
+		val.NewerNoncurrentVersions = val.MaxNoncurrentVersions
+	}
+	*n = NoncurrentVersionExpiration{
+		XMLName:                 val.XMLName,
+		NoncurrentDays:          val.NoncurrentDays,
+		NewerNoncurrentVersions: val.NewerNoncurrentVersions,
+	}
 	n.set = true
 	return nil
+}
+
+// IsNull returns if both NoncurrentDays and NoncurrentVersions are empty
+func (n NoncurrentVersionExpiration) IsNull() bool {
+	return n.IsDaysNull() && n.NewerNoncurrentVersions == 0
 }
 
 // IsDaysNull returns true if days field is null
@@ -62,7 +83,13 @@ func (n NoncurrentVersionExpiration) Validate() error {
 		return nil
 	}
 	val := int(n.NoncurrentDays)
-	if val <= 0 {
+	switch {
+	case val == 0 && n.NewerNoncurrentVersions == 0:
+		// both fields can't be zero
+		return errXMLNotWellFormed
+
+	case val < 0, n.NewerNoncurrentVersions < 0:
+		// negative values are not supported
 		return errXMLNotWellFormed
 	}
 	return nil
@@ -70,7 +97,7 @@ func (n NoncurrentVersionExpiration) Validate() error {
 
 // NoncurrentVersionTransition - an action for lifecycle configuration rule.
 type NoncurrentVersionTransition struct {
-	NoncurrentDays ExpirationDays `xml:"NoncurrentDays"`
+	NoncurrentDays TransitionDays `xml:"NoncurrentDays"`
 	StorageClass   string         `xml:"StorageClass"`
 	set            bool
 }
@@ -78,16 +105,11 @@ type NoncurrentVersionTransition struct {
 // MarshalXML is extended to leave out
 // <NoncurrentVersionTransition></NoncurrentVersionTransition> tags
 func (n NoncurrentVersionTransition) MarshalXML(e *xml.Encoder, start xml.StartElement) error {
-	if n.NoncurrentDays == ExpirationDays(0) {
+	if n.IsNull() {
 		return nil
 	}
 	type noncurrentVersionTransitionWrapper NoncurrentVersionTransition
 	return e.EncodeElement(noncurrentVersionTransitionWrapper(n), start)
-}
-
-// IsDaysNull returns true if days field is null
-func (n NoncurrentVersionTransition) IsDaysNull() bool {
-	return n.NoncurrentDays == ExpirationDays(0)
 }
 
 // UnmarshalXML decodes NoncurrentVersionExpiration
@@ -103,12 +125,18 @@ func (n *NoncurrentVersionTransition) UnmarshalXML(d *xml.Decoder, startElement 
 	return nil
 }
 
+// IsNull returns true if NoncurrentTransition doesn't refer to any storage-class.
+// Note: It supports immediate transition, i.e zero noncurrent days.
+func (n NoncurrentVersionTransition) IsNull() bool {
+	return n.StorageClass == ""
+}
+
 // Validate returns an error with wrong value
 func (n NoncurrentVersionTransition) Validate() error {
 	if !n.set {
 		return nil
 	}
-	if int(n.NoncurrentDays) <= 0 || n.StorageClass == "" {
+	if n.StorageClass == "" {
 		return errXMLNotWellFormed
 	}
 	return nil
@@ -117,10 +145,12 @@ func (n NoncurrentVersionTransition) Validate() error {
 // NextDue returns upcoming NoncurrentVersionTransition date for obj if
 // applicable, returns false otherwise.
 func (n NoncurrentVersionTransition) NextDue(obj ObjectOpts) (time.Time, bool) {
-	switch {
-	case obj.IsLatest, n.IsDaysNull():
+	if obj.IsLatest || n.StorageClass == "" {
 		return time.Time{}, false
 	}
-
+	// Days == 0 indicates immediate tiering, i.e object is eligible for tiering since it became noncurrent.
+	if n.NoncurrentDays == 0 {
+		return obj.SuccessorModTime, true
+	}
 	return ExpectedExpiryTime(obj.SuccessorModTime, int(n.NoncurrentDays)), true
 }

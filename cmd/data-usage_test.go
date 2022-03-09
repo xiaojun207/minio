@@ -41,7 +41,7 @@ func TestDataUsageUpdate(t *testing.T) {
 	}
 	const bucket = "bucket"
 	defer os.RemoveAll(base)
-	var files = []usageTestFile{
+	files := []usageTestFile{
 		{name: "rootfile", size: 10000},
 		{name: "rootfile2", size: 10000},
 		{name: "dir1/d1file", size: 2000},
@@ -67,13 +67,13 @@ func TestDataUsageUpdate(t *testing.T) {
 		return
 	}
 
-	got, err := scanDataFolder(context.Background(), base, dataUsageCache{Info: dataUsageCacheInfo{Name: bucket}}, getSize)
+	got, err := scanDataFolder(context.Background(), 0, 0, base, dataUsageCache{Info: dataUsageCacheInfo{Name: bucket}}, getSize)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	// Test dirs
-	var want = []struct {
+	want := []struct {
 		path       string
 		isNil      bool
 		size, objs int
@@ -178,7 +178,8 @@ func TestDataUsageUpdate(t *testing.T) {
 	}
 	// Changed dir must be picked up in this many cycles.
 	for i := 0; i < dataUsageUpdateDirCycles; i++ {
-		got, err = scanDataFolder(context.Background(), base, got, getSize)
+		got, err = scanDataFolder(context.Background(), 0, 0, base, got, getSize)
+		got.Info.NextCycle++
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -256,7 +257,7 @@ func TestDataUsageUpdatePrefix(t *testing.T) {
 	}
 	scannerSleeper.Update(0, 0)
 	defer os.RemoveAll(base)
-	var files = []usageTestFile{
+	files := []usageTestFile{
 		{name: "bucket/rootfile", size: 10000},
 		{name: "bucket/rootfile2", size: 10000},
 		{name: "bucket/dir1/d1file", size: 2000},
@@ -288,7 +289,7 @@ func TestDataUsageUpdatePrefix(t *testing.T) {
 		}
 		return
 	}
-	got, err := scanDataFolder(context.Background(), base, dataUsageCache{Info: dataUsageCacheInfo{Name: "bucket"}}, getSize)
+	got, err := scanDataFolder(context.Background(), 0, 0, base, dataUsageCache{Info: dataUsageCacheInfo{Name: "bucket"}}, getSize)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -301,7 +302,7 @@ func TestDataUsageUpdatePrefix(t *testing.T) {
 	}
 
 	// Test dirs
-	var want = []struct {
+	want := []struct {
 		path       string
 		isNil      bool
 		size, objs int
@@ -422,7 +423,8 @@ func TestDataUsageUpdatePrefix(t *testing.T) {
 	}
 	// Changed dir must be picked up in this many cycles.
 	for i := 0; i < dataUsageUpdateDirCycles; i++ {
-		got, err = scanDataFolder(context.Background(), base, got, getSize)
+		got, err = scanDataFolder(context.Background(), 0, 0, base, got, getSize)
+		got.Info.NextCycle++
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -541,7 +543,7 @@ func TestDataUsageCacheSerialize(t *testing.T) {
 	}
 	const bucket = "abucket"
 	defer os.RemoveAll(base)
-	var files = []usageTestFile{
+	files := []usageTestFile{
 		{name: "rootfile", size: 10000},
 		{name: "rootfile2", size: 10000},
 		{name: "dir1/d1file", size: 2000},
@@ -573,22 +575,21 @@ func TestDataUsageCacheSerialize(t *testing.T) {
 		}
 		return
 	}
-	want, err := scanDataFolder(context.Background(), base, dataUsageCache{Info: dataUsageCacheInfo{Name: bucket}}, getSize)
+	want, err := scanDataFolder(context.Background(), 0, 0, base, dataUsageCache{Info: dataUsageCacheInfo{Name: bucket}}, getSize)
 	if err != nil {
 		t.Fatal(err)
 	}
 	e := want.find("abucket/dir2")
-	e.ReplicationStats = &replicationStats{
-		PendingSize:          1,
-		ReplicatedSize:       2,
-		FailedSize:           3,
-		ReplicaSize:          4,
-		FailedCount:          5,
-		PendingCount:         6,
-		MissedThresholdSize:  7,
-		AfterThresholdSize:   8,
-		MissedThresholdCount: 9,
-		AfterThresholdCount:  10,
+	e.ReplicationStats = &replicationAllStats{
+		Targets: map[string]replicationStats{
+			"arn": {
+				PendingSize:    1,
+				ReplicatedSize: 2,
+				FailedSize:     3,
+				FailedCount:    5,
+				PendingCount:   6,
+			},
+		},
 	}
 	want.replace("abucket/dir2", "", *e)
 	var buf bytes.Buffer

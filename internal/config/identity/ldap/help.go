@@ -29,12 +29,6 @@ var (
 			Sensitive:   true,
 		},
 		config.HelpKV{
-			Key:         STSExpiry,
-			Description: `[DEPRECATED] temporary credentials validity duration in s,m,h,d. Default is "1h"`,
-			Optional:    true,
-			Type:        "duration",
-		},
-		config.HelpKV{
 			Key:         LookupBindDN,
 			Description: `DN for LDAP read-only service account used to perform DN and group lookups`,
 			Optional:    true,
@@ -50,22 +44,15 @@ var (
 		},
 		config.HelpKV{
 			Key:         UserDNSearchBaseDN,
-			Description: `Base LDAP DN to search for user DN`,
+			Description: `";" separated list of user search base DNs e.g. "dc=myldapserver,dc=com"`,
 			Optional:    true,
-			Type:        "string",
+			Type:        "list",
 		},
 		config.HelpKV{
 			Key:         UserDNSearchFilter,
 			Description: `Search filter to lookup user DN`,
 			Optional:    true,
 			Type:        "string",
-		},
-		config.HelpKV{
-			Key:         UsernameFormat,
-			Description: `[DEPRECATED] ";" separated list of username bind DNs e.g. "uid=%s,cn=accounts,dc=myldapserver,dc=com"`,
-			Optional:    true,
-			Type:        "list",
-			Sensitive:   true,
 		},
 		config.HelpKV{
 			Key:         GroupSearchFilter,

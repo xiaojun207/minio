@@ -52,7 +52,7 @@ func setCommonHeaders(w http.ResponseWriter) {
 
 	// Set `x-amz-bucket-region` only if region is set on the server
 	// by default minio uses an empty region.
-	if region := globalServerRegion; region != "" {
+	if region := globalSite.Region; region != "" {
 		w.Header().Set(xhttp.AmzBucketRegion, region)
 	}
 	w.Header().Set(xhttp.AcceptRanges, "bytes")
@@ -126,6 +126,11 @@ func setObjectHeaders(w http.ResponseWriter, objInfo ObjectInfo, rs *HTTPRangeSp
 
 	// Set all other user defined metadata.
 	for k, v := range objInfo.UserDefined {
+		// Empty values for object lock and retention can be skipped.
+		if v == "" && equals(k, xhttp.AmzObjectLockMode, xhttp.AmzObjectLockRetainUntilDate) {
+			continue
+		}
+
 		if strings.HasPrefix(strings.ToLower(k), ReservedMetadataPrefixLower) {
 			// Do not need to send any internal metadata
 			// values to client.
@@ -187,7 +192,7 @@ func setObjectHeaders(w http.ResponseWriter, objInfo ObjectInfo, rs *HTTPRangeSp
 	if objInfo.IsRemote() {
 		// Check if object is being restored. For more information on x-amz-restore header see
 		// https://docs.aws.amazon.com/AmazonS3/latest/API/API_HeadObject.html#API_HeadObject_ResponseSyntax
-		w.Header()[xhttp.AmzStorageClass] = []string{objInfo.TransitionTier}
+		w.Header()[xhttp.AmzStorageClass] = []string{objInfo.TransitionedObject.Tier}
 	}
 
 	if lc, err := globalLifecycleSys.Get(objInfo.Bucket); err == nil {

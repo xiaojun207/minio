@@ -30,7 +30,7 @@ import (
 	"testing"
 	"time"
 
-	humanize "github.com/dustin/go-humanize"
+	"github.com/dustin/go-humanize"
 )
 
 const (
@@ -61,8 +61,8 @@ func newPostPolicyBytesV4WithContentRange(credential, bucketName, objectKey stri
 		keyConditionStr, contentLengthCondStr, algorithmConditionStr, dateConditionStr, credentialConditionStr, uuidConditionStr)
 	retStr := "{"
 	retStr = retStr + expirationStr + ","
-	retStr = retStr + conditionStr
-	retStr = retStr + "}"
+	retStr += conditionStr
+	retStr += "}"
 
 	return []byte(retStr)
 }
@@ -89,8 +89,8 @@ func newPostPolicyBytesV4(credential, bucketName, objectKey string, expiration t
 	conditionStr := fmt.Sprintf(`"conditions":[%s, %s, %s, %s, %s, %s]`, bucketConditionStr, keyConditionStr, algorithmConditionStr, dateConditionStr, credentialConditionStr, uuidConditionStr)
 	retStr := "{"
 	retStr = retStr + expirationStr + ","
-	retStr = retStr + conditionStr
-	retStr = retStr + "}"
+	retStr += conditionStr
+	retStr += "}"
 
 	return []byte(retStr)
 }
@@ -108,8 +108,8 @@ func newPostPolicyBytesV2(bucketName, objectKey string, expiration time.Time) []
 	conditionStr := fmt.Sprintf(`"conditions":[%s, %s]`, bucketConditionStr, keyConditionStr)
 	retStr := "{"
 	retStr = retStr + expirationStr + ","
-	retStr = retStr + conditionStr
-	retStr = retStr + "}"
+	retStr += conditionStr
+	retStr += "}"
 
 	return []byte(retStr)
 }
@@ -267,6 +267,16 @@ func testPostPolicyBucketHandler(obj ObjectLayer, instanceType string, t TestErr
 			dates:              []interface{}{curTimePlus5Min.Format(iso8601TimeFormat), curTime.Format(iso8601DateFormat), curTime.Format(yyyymmdd)},
 			policy:             `{"expiration": "%s","conditions":[["eq", "$bucket", "` + bucketName + `"], ["starts-with", "$key", "test/"], ["eq", "$x-amz-algorithm", "AWS4-HMAC-SHA256"], ["eq", "$x-amz-date", "%s"], ["eq", "$x-amz-credential", "` + credentials.AccessKey + `/%s/us-east-1/s3/aws4_request"],["eq", "$x-amz-meta-uuid", "1234"]]}`,
 		},
+		// Success case, big body.
+		{
+			objectName:         "test",
+			data:               bytes.Repeat([]byte("a"), 10<<20),
+			expectedRespStatus: http.StatusNoContent,
+			accessKey:          credentials.AccessKey,
+			secretKey:          credentials.SecretKey,
+			dates:              []interface{}{curTimePlus5Min.Format(iso8601TimeFormat), curTime.Format(iso8601DateFormat), curTime.Format(yyyymmdd)},
+			policy:             `{"expiration": "%s","conditions":[["eq", "$bucket", "` + bucketName + `"], ["starts-with", "$key", "test/"], ["eq", "$x-amz-algorithm", "AWS4-HMAC-SHA256"], ["eq", "$x-amz-date", "%s"], ["eq", "$x-amz-credential", "` + credentials.AccessKey + `/%s/us-east-1/s3/aws4_request"],["eq", "$x-amz-meta-uuid", "1234"]]}`,
+		},
 		// Corrupted Base 64 result
 		{
 			objectName:         "test",
@@ -412,7 +422,6 @@ func testPostPolicyBucketHandler(obj ObjectLayer, instanceType string, t TestErr
 			t.Errorf("Test %d: %s: Expected the response status to be `%d`, but instead found `%d`", i+1, instanceType, testCase.expectedRespStatus, rec.Code)
 		}
 	}
-
 }
 
 // Wrapper for calling TestPostPolicyBucketHandlerRedirect tests for both Erasure multiple disks and single node setup.
@@ -497,7 +506,6 @@ func testPostPolicyBucketHandlerRedirect(obj ObjectLayer, instanceType string, t
 	if rec.Header().Get("Location") != expectedLocation {
 		t.Errorf("Unexpected location, expected = %s, found = `%s`", rec.Header().Get("Location"), expectedLocation)
 	}
-
 }
 
 // postPresignSignatureV4 - presigned signature for PostPolicy requests.

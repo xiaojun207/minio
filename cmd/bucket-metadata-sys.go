@@ -74,60 +74,22 @@ func (sys *BucketMetadataSys) Set(bucket string, meta BucketMetadata) {
 
 // Update update bucket metadata for the specified config file.
 // The configData data should not be modified after being sent here.
-func (sys *BucketMetadataSys) Update(bucket string, configFile string, configData []byte) error {
+func (sys *BucketMetadataSys) Update(ctx context.Context, bucket string, configFile string, configData []byte) error {
 	objAPI := newObjectLayerFn()
 	if objAPI == nil {
 		return errServerNotInitialized
 	}
 
-	if globalIsGateway {
-		// This code is needed only for gateway implementations.
-		switch configFile {
-		case bucketSSEConfig:
-			if globalGatewayName == NASBackendGateway {
-				meta, err := loadBucketMetadata(GlobalContext, objAPI, bucket)
-				if err != nil {
-					return err
-				}
-				meta.EncryptionConfigXML = configData
-				return meta.Save(GlobalContext, objAPI)
-			}
-		case bucketLifecycleConfig:
-			if globalGatewayName == NASBackendGateway {
-				meta, err := loadBucketMetadata(GlobalContext, objAPI, bucket)
-				if err != nil {
-					return err
-				}
-				meta.LifecycleConfigXML = configData
-				return meta.Save(GlobalContext, objAPI)
-			}
-		case bucketTaggingConfig:
-			if globalGatewayName == NASBackendGateway {
-				meta, err := loadBucketMetadata(GlobalContext, objAPI, bucket)
-				if err != nil {
-					return err
-				}
-				meta.TaggingConfigXML = configData
-				return meta.Save(GlobalContext, objAPI)
-			}
-		case bucketNotificationConfig:
-			if globalGatewayName == NASBackendGateway {
-				meta, err := loadBucketMetadata(GlobalContext, objAPI, bucket)
-				if err != nil {
-					return err
-				}
-				meta.NotificationConfigXML = configData
-				return meta.Save(GlobalContext, objAPI)
-			}
-		case bucketPolicyConfig:
+	if globalIsGateway && globalGatewayName != NASBackendGateway {
+		if configFile == bucketPolicyConfig {
 			if configData == nil {
-				return objAPI.DeleteBucketPolicy(GlobalContext, bucket)
+				return objAPI.DeleteBucketPolicy(ctx, bucket)
 			}
 			config, err := policy.ParseConfig(bytes.NewReader(configData), bucket)
 			if err != nil {
 				return err
 			}
-			return objAPI.SetBucketPolicy(GlobalContext, bucket, config)
+			return objAPI.SetBucketPolicy(ctx, bucket, config)
 		}
 		return NotImplemented{}
 	}
@@ -136,9 +98,14 @@ func (sys *BucketMetadataSys) Update(bucket string, configFile string, configDat
 		return errInvalidArgument
 	}
 
-	meta, err := loadBucketMetadata(GlobalContext, objAPI, bucket)
+	meta, err := loadBucketMetadata(ctx, objAPI, bucket)
 	if err != nil {
-		return err
+		if !globalIsErasure && !globalIsDistErasure && errors.Is(err, errVolumeNotFound) {
+			// Only single drive mode needs this fallback.
+			meta = newBucketMetadata(bucket)
+		} else {
+			return err
+		}
 	}
 
 	switch configFile {
@@ -181,12 +148,12 @@ func (sys *BucketMetadataSys) Update(bucket string, configFile string, configDat
 		return fmt.Errorf("Unknown bucket %s metadata update requested %s", bucket, configFile)
 	}
 
-	if err := meta.Save(GlobalContext, objAPI); err != nil {
+	if err := meta.Save(ctx, objAPI); err != nil {
 		return err
 	}
 
 	sys.Set(bucket, meta)
-	globalNotificationSys.LoadBucketMetadata(GlobalContext, bucket)
+	globalNotificationSys.LoadBucketMetadata(bgContext(ctx), bucket) // Do not use caller context here
 
 	return nil
 }
@@ -220,7 +187,7 @@ func (sys *BucketMetadataSys) Get(bucket string) (BucketMetadata, error) {
 // GetVersioningConfig returns configured versioning config
 // The returned object may not be modified.
 func (sys *BucketMetadataSys) GetVersioningConfig(bucket string) (*versioning.Versioning, error) {
-	meta, err := sys.GetConfig(bucket)
+	meta, err := sys.GetConfig(GlobalContext, bucket)
 	if err != nil {
 		return nil, err
 	}
@@ -230,7 +197,7 @@ func (sys *BucketMetadataSys) GetVersioningConfig(bucket string) (*versioning.Ve
 // GetTaggingConfig returns configured tagging config
 // The returned object may not be modified.
 func (sys *BucketMetadataSys) GetTaggingConfig(bucket string) (*tags.Tags, error) {
-	meta, err := sys.GetConfig(bucket)
+	meta, err := sys.GetConfig(GlobalContext, bucket)
 	if err != nil {
 		if errors.Is(err, errConfigNotFound) {
 			return nil, BucketTaggingNotFound{Bucket: bucket}
@@ -246,7 +213,7 @@ func (sys *BucketMetadataSys) GetTaggingConfig(bucket string) (*tags.Tags, error
 // GetObjectLockConfig returns configured object lock config
 // The returned object may not be modified.
 func (sys *BucketMetadataSys) GetObjectLockConfig(bucket string) (*objectlock.Config, error) {
-	meta, err := sys.GetConfig(bucket)
+	meta, err := sys.GetConfig(GlobalContext, bucket)
 	if err != nil {
 		if errors.Is(err, errConfigNotFound) {
 			return nil, BucketObjectLockConfigNotFound{Bucket: bucket}
@@ -278,7 +245,7 @@ func (sys *BucketMetadataSys) GetLifecycleConfig(bucket string) (*lifecycle.Life
 		return meta.lifecycleConfig, nil
 	}
 
-	meta, err := sys.GetConfig(bucket)
+	meta, err := sys.GetConfig(GlobalContext, bucket)
 	if err != nil {
 		if errors.Is(err, errConfigNotFound) {
 			return nil, BucketLifecycleNotFound{Bucket: bucket}
@@ -307,7 +274,7 @@ func (sys *BucketMetadataSys) GetNotificationConfig(bucket string) (*event.Confi
 		return meta.notificationConfig, nil
 	}
 
-	meta, err := sys.GetConfig(bucket)
+	meta, err := sys.GetConfig(GlobalContext, bucket)
 	if err != nil {
 		return nil, err
 	}
@@ -317,7 +284,7 @@ func (sys *BucketMetadataSys) GetNotificationConfig(bucket string) (*event.Confi
 // GetSSEConfig returns configured SSE config
 // The returned object may not be modified.
 func (sys *BucketMetadataSys) GetSSEConfig(bucket string) (*bucketsse.BucketSSEConfig, error) {
-	meta, err := sys.GetConfig(bucket)
+	meta, err := sys.GetConfig(GlobalContext, bucket)
 	if err != nil {
 		if errors.Is(err, errConfigNotFound) {
 			return nil, BucketSSEConfigNotFound{Bucket: bucket}
@@ -341,7 +308,7 @@ func (sys *BucketMetadataSys) GetPolicyConfig(bucket string) (*policy.Policy, er
 		return objAPI.GetBucketPolicy(GlobalContext, bucket)
 	}
 
-	meta, err := sys.GetConfig(bucket)
+	meta, err := sys.GetConfig(GlobalContext, bucket)
 	if err != nil {
 		if errors.Is(err, errConfigNotFound) {
 			return nil, BucketPolicyNotFound{Bucket: bucket}
@@ -356,8 +323,8 @@ func (sys *BucketMetadataSys) GetPolicyConfig(bucket string) (*policy.Policy, er
 
 // GetQuotaConfig returns configured bucket quota
 // The returned object may not be modified.
-func (sys *BucketMetadataSys) GetQuotaConfig(bucket string) (*madmin.BucketQuota, error) {
-	meta, err := sys.GetConfig(bucket)
+func (sys *BucketMetadataSys) GetQuotaConfig(ctx context.Context, bucket string) (*madmin.BucketQuota, error) {
+	meta, err := sys.GetConfig(ctx, bucket)
 	if err != nil {
 		return nil, err
 	}
@@ -367,7 +334,7 @@ func (sys *BucketMetadataSys) GetQuotaConfig(bucket string) (*madmin.BucketQuota
 // GetReplicationConfig returns configured bucket replication config
 // The returned object may not be modified.
 func (sys *BucketMetadataSys) GetReplicationConfig(ctx context.Context, bucket string) (*replication.Config, error) {
-	meta, err := sys.GetConfig(bucket)
+	meta, err := sys.GetConfig(ctx, bucket)
 	if err != nil {
 		if errors.Is(err, errConfigNotFound) {
 			return nil, BucketReplicationConfigNotFound{Bucket: bucket}
@@ -384,7 +351,7 @@ func (sys *BucketMetadataSys) GetReplicationConfig(ctx context.Context, bucket s
 // GetBucketTargetsConfig returns configured bucket targets for this bucket
 // The returned object may not be modified.
 func (sys *BucketMetadataSys) GetBucketTargetsConfig(bucket string) (*madmin.BucketTargets, error) {
-	meta, err := sys.GetConfig(bucket)
+	meta, err := sys.GetConfig(GlobalContext, bucket)
 	if err != nil {
 		return nil, err
 	}
@@ -410,7 +377,7 @@ func (sys *BucketMetadataSys) GetBucketTarget(bucket string, arn string) (madmin
 
 // GetConfig returns a specific configuration from the bucket metadata.
 // The returned object may not be modified.
-func (sys *BucketMetadataSys) GetConfig(bucket string) (BucketMetadata, error) {
+func (sys *BucketMetadataSys) GetConfig(ctx context.Context, bucket string) (BucketMetadata, error) {
 	objAPI := newObjectLayerFn()
 	if objAPI == nil {
 		return newBucketMetadata(bucket), errServerNotInitialized
@@ -430,7 +397,7 @@ func (sys *BucketMetadataSys) GetConfig(bucket string) (BucketMetadata, error) {
 	if ok {
 		return meta, nil
 	}
-	meta, err := loadBucketMetadata(GlobalContext, objAPI, bucket)
+	meta, err := loadBucketMetadata(ctx, objAPI, bucket)
 	if err != nil {
 		return meta, err
 	}
@@ -447,9 +414,9 @@ func (sys *BucketMetadataSys) Init(ctx context.Context, buckets []BucketInfo, ob
 		return errServerNotInitialized
 	}
 
-	// In gateway mode, we don't need to load the policies
-	// from the backend.
-	if globalIsGateway {
+	// In gateway mode, we don't need to load bucket metadata except
+	// NAS gateway backend.
+	if globalIsGateway && !objAPI.IsNotificationSupported() {
 		return nil
 	}
 
@@ -467,14 +434,24 @@ func (sys *BucketMetadataSys) concurrentLoad(ctx context.Context, buckets []Buck
 			_, _ = objAPI.HealBucket(ctx, buckets[index].Name, madmin.HealOpts{
 				// Ensure heal opts for bucket metadata be deep healed all the time.
 				ScanMode: madmin.HealDeepScan,
+				Recreate: true,
 			})
 			meta, err := loadBucketMetadata(ctx, objAPI, buckets[index].Name)
 			if err != nil {
-				return err
+				if !globalIsErasure && !globalIsDistErasure && errors.Is(err, errVolumeNotFound) {
+					meta = newBucketMetadata(buckets[index].Name)
+				} else {
+					return err
+				}
 			}
 			sys.Lock()
 			sys.metadataMap[buckets[index].Name] = meta
 			sys.Unlock()
+
+			globalNotificationSys.set(buckets[index], meta) // set notification targets
+
+			globalBucketTargetSys.set(buckets[index], meta) // set remote replication targets
+
 			return nil
 		}, index)
 	}

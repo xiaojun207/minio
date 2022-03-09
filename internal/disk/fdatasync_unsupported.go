@@ -1,3 +1,4 @@
+//go:build !linux && !netbsd && !freebsd && !darwin && !openbsd
 // +build !linux,!netbsd,!freebsd,!darwin,!openbsd
 
 // Copyright (c) 2015-2021 MinIO, Inc.
@@ -25,5 +26,10 @@ import (
 
 // Fdatasync is a no-op
 func Fdatasync(f *os.File) error {
+	return nil
+}
+
+// FadviseDontNeed is a no-op
+func FadviseDontNeed(f *os.File) error {
 	return nil
 }

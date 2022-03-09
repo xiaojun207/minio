@@ -18,13 +18,11 @@
 package cmd
 
 import (
-	"math"
 	"net/http"
 	"strings"
 	"sync/atomic"
 	"time"
 
-	"github.com/minio/madmin-go"
 	"github.com/minio/minio/internal/logger"
 	iampolicy "github.com/minio/pkg/iam/policy"
 	"github.com/prometheus/client_golang/prometheus"
@@ -94,7 +92,6 @@ func (c *minioCollector) Describe(ch chan<- *prometheus.Desc) {
 
 // Collect is called by the Prometheus registry when collecting metrics.
 func (c *minioCollector) Collect(ch chan<- prometheus.Metric) {
-
 	// Expose MinIO's version information
 	minioVersionInfo.WithLabelValues(Version, CommitID).Set(1.0)
 
@@ -109,6 +106,10 @@ func (c *minioCollector) Collect(ch chan<- prometheus.Metric) {
 }
 
 func nodeHealthMetricsPrometheus(ch chan<- prometheus.Metric) {
+	if globalIsGateway {
+		return
+	}
+
 	nodesUp, nodesDown := GetPeerOnlineCount()
 	ch <- prometheus.MustNewConstMetric(
 		prometheus.NewDesc(
@@ -434,34 +435,6 @@ func networkMetricsPrometheus(ch chan<- prometheus.Metric) {
 	)
 }
 
-// get the most current of in-memory replication stats  and data usage info from crawler.
-func getLatestReplicationStats(bucket string, u madmin.BucketUsageInfo) (s BucketReplicationStats) {
-	bucketStats := globalNotificationSys.GetClusterBucketStats(GlobalContext, bucket)
-
-	replStats := BucketReplicationStats{}
-	for _, bucketStat := range bucketStats {
-		replStats.FailedCount += bucketStat.ReplicationStats.FailedCount
-		replStats.FailedSize += bucketStat.ReplicationStats.FailedSize
-		replStats.ReplicaSize += bucketStat.ReplicationStats.ReplicaSize
-		replStats.ReplicatedSize += bucketStat.ReplicationStats.ReplicatedSize
-	}
-	usageStat := globalReplicationStats.GetInitialUsage(bucket)
-	replStats.ReplicaSize += usageStat.ReplicaSize
-	replStats.ReplicatedSize += usageStat.ReplicatedSize
-
-	// use in memory replication stats if it is ahead of usage info.
-	s.ReplicatedSize = u.ReplicatedSize
-	if replStats.ReplicatedSize >= u.ReplicatedSize {
-		s.ReplicatedSize = replStats.ReplicatedSize
-	}
-	// Reset FailedSize and FailedCount to 0 for negative overflows which can
-	// happen since data usage picture can lag behind actual usage state at the time of cluster start
-	s.FailedSize = uint64(math.Max(float64(replStats.FailedSize), 0))
-	s.FailedCount = uint64(math.Max(float64(replStats.FailedCount), 0))
-	s.ReplicaSize = uint64(math.Max(float64(replStats.ReplicaSize), float64(u.ReplicaSize)))
-	return s
-}
-
 // Populates prometheus with bucket usage metrics, this metrics
 // is only enabled if scanner is enabled.
 func bucketUsageMetricsPrometheus(ch chan<- prometheus.Metric) {
@@ -673,7 +646,6 @@ func storageMetricsPrometheus(ch chan<- prometheus.Metric) {
 }
 
 func metricsHandler() http.Handler {
-
 	registry := prometheus.NewRegistry()
 
 	err := registry.Register(minioVersionInfo)
@@ -697,13 +669,12 @@ func metricsHandler() http.Handler {
 				ErrorHandling: promhttp.ContinueOnError,
 			}),
 	)
-
 }
 
 // AuthMiddleware checks if the bearer token is valid and authorized.
 func AuthMiddleware(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		claims, owner, authErr := webRequestAuthenticate(r)
+		claims, groups, owner, authErr := webRequestAuthenticate(r)
 		if authErr != nil || !claims.VerifyIssuer("prometheus", true) {
 			w.WriteHeader(http.StatusForbidden)
 			return
@@ -711,6 +682,7 @@ func AuthMiddleware(h http.Handler) http.Handler {
 		// For authenticated users apply IAM policy.
 		if !globalIAMSys.IsAllowed(iampolicy.Args{
 			AccountName:     claims.AccessKey,
+			Groups:          groups,
 			Action:          iampolicy.PrometheusAdminAction,
 			ConditionValues: getConditionValues(r, "", claims.AccessKey, claims.Map()),
 			IsOwner:         owner,

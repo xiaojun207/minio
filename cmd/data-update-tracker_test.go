@@ -31,6 +31,7 @@ import (
 
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/minio/internal/logger/message/log"
+	"github.com/minio/minio/internal/logger/target/types"
 )
 
 type testLoggerI interface {
@@ -55,6 +56,13 @@ func (t *testingLogger) Init() error {
 	return nil
 }
 
+func (t *testingLogger) Cancel() {
+}
+
+func (t *testingLogger) Type() types.TargetType {
+	return types.TargetHTTP
+}
+
 func (t *testingLogger) Send(entry interface{}, errKind string) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -73,7 +81,7 @@ func (t *testingLogger) Send(entry interface{}, errKind string) error {
 
 func addTestingLogging(t testLoggerI) func() {
 	tl := &testingLogger{t: t}
-	logger.AddTarget(tl)
+	logger.AddSystemTarget(tl)
 	return func() {
 		tl.mu.Lock()
 		defer tl.mu.Unlock()
@@ -105,7 +113,7 @@ func TestDataUpdateTracker(t *testing.T) {
 	defer cancel()
 	dut.start(ctx, tmpDir)
 
-	var tests = []struct {
+	tests := []struct {
 		in    string
 		check []string // if not empty, check against these instead.
 		exist bool

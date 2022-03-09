@@ -45,9 +45,10 @@ func (az *warmBackendAzure) getDest(object string) string {
 	}
 	return destObj
 }
+
 func (az *warmBackendAzure) tier() azblob.AccessTierType {
 	for _, t := range azblob.PossibleAccessTierTypeValues() {
-		if strings.ToLower(az.StorageClass) == strings.ToLower(string(t)) {
+		if strings.EqualFold(az.StorageClass, string(t)) {
 			return t
 		}
 	}
@@ -66,7 +67,10 @@ func (az *warmBackendAzure) Put(ctx context.Context, object string, r io.Reader,
 		}
 	}
 	res, err := azblob.UploadStreamToBlockBlob(ctx, r, blobURL, azblob.UploadStreamToBlockBlobOptions{})
-	return remoteVersionID(res.Version()), azureToObjectError(err, az.Bucket, object)
+	if err != nil {
+		return "", azureToObjectError(err, az.Bucket, object)
+	}
+	return remoteVersionID(res.Version()), nil
 }
 
 func (az *warmBackendAzure) Get(ctx context.Context, object string, rv remoteVersionID, opts WarmBackendGetOpts) (r io.ReadCloser, err error) {

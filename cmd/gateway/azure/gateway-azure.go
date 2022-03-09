@@ -38,7 +38,7 @@ import (
 
 	"github.com/Azure/azure-pipeline-go/pipeline"
 	"github.com/Azure/azure-storage-blob-go/azblob"
-	humanize "github.com/dustin/go-humanize"
+	"github.com/dustin/go-humanize"
 	"github.com/minio/cli"
 	"github.com/minio/madmin-go"
 	miniogopolicy "github.com/minio/minio-go/v7/pkg/policy"
@@ -274,7 +274,7 @@ func s3MetaToAzureProperties(ctx context.Context, s3Metadata map[string]string) 
 	encodeKey := func(key string) string {
 		tokens := strings.Split(key, "_")
 		for i := range tokens {
-			tokens[i] = strings.Replace(tokens[i], "-", "_", -1)
+			tokens[i] = strings.ReplaceAll(tokens[i], "-", "_")
 		}
 		return strings.Join(tokens, "__")
 	}
@@ -349,7 +349,6 @@ func azureTierToS3StorageClass(tierType string) string {
 	default:
 		return "STANDARD"
 	}
-
 }
 
 // azurePropertiesToS3Meta converts Azure metadata/properties to S3
@@ -367,7 +366,7 @@ func azurePropertiesToS3Meta(meta azblob.Metadata, props azblob.BlobHTTPHeaders,
 	decodeKey := func(key string) string {
 		tokens := strings.Split(key, "__")
 		for i := range tokens {
-			tokens[i] = strings.Replace(tokens[i], "_", "-", -1)
+			tokens[i] = strings.ReplaceAll(tokens[i], "_", "-")
 		}
 		return strings.Join(tokens, "_")
 	}
@@ -578,7 +577,6 @@ func (a *azureObjects) GetBucketInfo(ctx context.Context, bucket string) (bi min
 		resp, err := a.client.ListContainersSegment(ctx, marker, azblob.ListContainersSegmentOptions{
 			Prefix: bucket,
 		})
-
 		if err != nil {
 			return bi, azureToObjectError(err, bucket)
 		}
@@ -604,7 +602,6 @@ func (a *azureObjects) ListBuckets(ctx context.Context) (buckets []minio.BucketI
 
 	for marker.NotDone() {
 		resp, err := a.client.ListContainersSegment(ctx, marker, azblob.ListContainersSegmentOptions{})
-
 		if err != nil {
 			return nil, azureToObjectError(err)
 		}
@@ -623,8 +620,8 @@ func (a *azureObjects) ListBuckets(ctx context.Context) (buckets []minio.BucketI
 }
 
 // DeleteBucket - delete a container on azure, uses Azure equivalent `ContainerURL.Delete`.
-func (a *azureObjects) DeleteBucket(ctx context.Context, bucket string, forceDelete bool) error {
-	if !forceDelete {
+func (a *azureObjects) DeleteBucket(ctx context.Context, bucket string, opts minio.DeleteBucketOptions) error {
+	if !opts.Force {
 		// Check if the container is empty before deleting it.
 		result, err := a.ListObjects(ctx, bucket, "", "", "", 1)
 		if err != nil {
@@ -1419,6 +1416,7 @@ func (a *azureObjects) GetBucketPolicy(ctx context.Context, bucket string) (*pol
 		Version: policy.DefaultVersion,
 		Statements: []policy.Statement{
 			policy.NewStatement(
+				"",
 				policy.Allow,
 				policy.NewPrincipal("*"),
 				policy.NewActionSet(

@@ -172,11 +172,12 @@ func getConditionValues(r *http.Request, lc string, username string, claims map[
 		vStr, ok := v.(string)
 		if ok {
 			// Special case for AD/LDAP STS users
-			if k == ldapUser {
+			switch k {
+			case ldapUser:
 				args["user"] = []string{vStr}
-			} else if k == ldapUserN {
+			case ldapUserN:
 				args["username"] = []string{vStr}
-			} else {
+			default:
 				args[k] = []string{vStr}
 			}
 		}
@@ -199,7 +200,7 @@ func PolicyToBucketAccessPolicy(bucketPolicy *policy.Policy) (*miniogopolicy.Buc
 	}
 
 	var policyInfo miniogopolicy.BucketAccessPolicy
-	var json = jsoniter.ConfigCompatibleWithStandardLibrary
+	json := jsoniter.ConfigCompatibleWithStandardLibrary
 	if err = json.Unmarshal(data, &policyInfo); err != nil {
 		// This should not happen because data is valid to JSON data.
 		return nil, err
@@ -217,7 +218,7 @@ func BucketAccessPolicyToPolicy(policyInfo *miniogopolicy.BucketAccessPolicy) (*
 	}
 
 	var bucketPolicy policy.Policy
-	var json = jsoniter.ConfigCompatibleWithStandardLibrary
+	json := jsoniter.ConfigCompatibleWithStandardLibrary
 	if err = json.Unmarshal(data, &bucketPolicy); err != nil {
 		// This should not happen because data is valid to JSON data.
 		return nil, err

@@ -20,13 +20,12 @@ package cmd
 import (
 	"context"
 	"errors"
+	"fmt"
 	pathutil "path"
 	"runtime"
 	"sort"
 	"strings"
 	"sync"
-
-	"fmt"
 	"time"
 
 	"github.com/minio/minio/internal/dsync"
@@ -226,6 +225,7 @@ func (n *nsLockMap) NewNSLock(lockers func() ([]dsync.NetLocker, string), volume
 	if n.isDistErasure {
 		drwmutex := dsync.NewDRWMutex(&dsync.Dsync{
 			GetLockers: lockers,
+			Timeouts:   dsync.DefaultTimeouts,
 		}, pathsJoinPrefix(volume, paths...)...)
 		return &distLockInstance{drwmutex, opsID}
 	}

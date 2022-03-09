@@ -29,6 +29,9 @@ import (
 	c "github.com/minio/pkg/console"
 )
 
+// ConsoleLoggerTgt is a stringified value to represent console logging
+const ConsoleLoggerTgt = "console+http"
+
 // Logger interface describes the methods that need to be implemented to satisfy the interface requirements.
 type Logger interface {
 	json(msg string, args ...interface{})
@@ -67,8 +70,7 @@ func fatal(err error, msg string, data ...interface{}) {
 
 var fatalMessage fatalMsg
 
-type fatalMsg struct {
-}
+type fatalMsg struct{}
 
 func (f fatalMsg) json(msg string, args ...interface{}) {
 	var message string
@@ -80,7 +82,7 @@ func (f fatalMsg) json(msg string, args ...interface{}) {
 	logJSON, err := json.Marshal(&log.Entry{
 		Level:   FatalLvl.String(),
 		Message: message,
-		Time:    time.Now().UTC().Format(time.RFC3339Nano),
+		Time:    time.Now().UTC(),
 		Trace:   &log.Trace{Message: message, Source: []string{getSource(6)}},
 	})
 	if err != nil {
@@ -89,7 +91,6 @@ func (f fatalMsg) json(msg string, args ...interface{}) {
 	fmt.Println(string(logJSON))
 
 	os.Exit(1)
-
 }
 
 func (f fatalMsg) quiet(msg string, args ...interface{}) {
@@ -159,7 +160,7 @@ func (i infoMsg) json(msg string, args ...interface{}) {
 	logJSON, err := json.Marshal(&log.Entry{
 		Level:   InformationLvl.String(),
 		Message: message,
-		Time:    time.Now().UTC().Format(time.RFC3339Nano),
+		Time:    time.Now().UTC(),
 	})
 	if err != nil {
 		panic(err)
@@ -168,7 +169,6 @@ func (i infoMsg) json(msg string, args ...interface{}) {
 }
 
 func (i infoMsg) quiet(msg string, args ...interface{}) {
-	i.pretty(msg, args...)
 }
 
 func (i infoMsg) pretty(msg string, args ...interface{}) {
@@ -192,7 +192,7 @@ func (i errorMsg) json(msg string, args ...interface{}) {
 	logJSON, err := json.Marshal(&log.Entry{
 		Level:   ErrorLvl.String(),
 		Message: message,
-		Time:    time.Now().UTC().Format(time.RFC3339Nano),
+		Time:    time.Now().UTC(),
 		Trace:   &log.Trace{Message: message, Source: []string{getSource(6)}},
 	})
 	if err != nil {
@@ -220,24 +220,4 @@ func Error(msg string, data ...interface{}) {
 // Info :
 func Info(msg string, data ...interface{}) {
 	consoleLog(info, msg, data...)
-}
-
-var startupMessage startUpMsg
-
-type startUpMsg struct {
-}
-
-func (s startUpMsg) json(msg string, args ...interface{}) {
-}
-
-func (s startUpMsg) quiet(msg string, args ...interface{}) {
-}
-
-func (s startUpMsg) pretty(msg string, args ...interface{}) {
-	c.Printf(msg, args...)
-}
-
-// StartupMessage :
-func StartupMessage(msg string, data ...interface{}) {
-	consoleLog(startupMessage, msg, data...)
 }

@@ -26,6 +26,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -74,43 +75,83 @@ func NewLifecycleSys() *LifecycleSys {
 }
 
 type expiryTask struct {
-	objInfo       ObjectInfo
-	versionExpiry bool
+	objInfo        ObjectInfo
+	versionExpiry  bool
+	restoredObject bool
 }
 
 type expiryState struct {
-	once     sync.Once
-	expiryCh chan expiryTask
+	once                sync.Once
+	byDaysCh            chan expiryTask
+	byNewerNoncurrentCh chan newerNoncurrentTask
 }
 
-func (es *expiryState) queueExpiryTask(oi ObjectInfo, rmVersion bool) {
+// PendingTasks returns the number of pending ILM expiry tasks.
+func (es *expiryState) PendingTasks() int {
+	return len(es.byDaysCh) + len(es.byNewerNoncurrentCh)
+}
+
+// close closes work channels exactly once.
+func (es *expiryState) close() {
+	es.once.Do(func() {
+		close(es.byDaysCh)
+		close(es.byNewerNoncurrentCh)
+	})
+}
+
+// enqueueByDays enqueues object versions expired by days for expiry.
+func (es *expiryState) enqueueByDays(oi ObjectInfo, restoredObject bool, rmVersion bool) {
 	select {
 	case <-GlobalContext.Done():
-		es.once.Do(func() {
-			close(es.expiryCh)
-		})
-	case es.expiryCh <- expiryTask{objInfo: oi, versionExpiry: rmVersion}:
+		es.close()
+	case es.byDaysCh <- expiryTask{objInfo: oi, versionExpiry: rmVersion, restoredObject: restoredObject}:
 	default:
 	}
 }
 
-var (
-	globalExpiryState *expiryState
-)
+// enqueueByNewerNoncurrent enqueues object versions expired by
+// NewerNoncurrentVersions limit for expiry.
+func (es *expiryState) enqueueByNewerNoncurrent(bucket string, versions []ObjectToDelete) {
+	select {
+	case <-GlobalContext.Done():
+		es.close()
+	case es.byNewerNoncurrentCh <- newerNoncurrentTask{bucket: bucket, versions: versions}:
+	default:
+	}
+}
+
+var globalExpiryState *expiryState
 
 func newExpiryState() *expiryState {
 	return &expiryState{
-		expiryCh: make(chan expiryTask, 10000),
+		byDaysCh:            make(chan expiryTask, 10000),
+		byNewerNoncurrentCh: make(chan newerNoncurrentTask, 10000),
 	}
 }
 
 func initBackgroundExpiry(ctx context.Context, objectAPI ObjectLayer) {
 	globalExpiryState = newExpiryState()
 	go func() {
-		for t := range globalExpiryState.expiryCh {
-			applyExpiryRule(ctx, objectAPI, t.objInfo, false, t.versionExpiry)
+		for t := range globalExpiryState.byDaysCh {
+			if t.objInfo.TransitionedObject.Status != "" {
+				applyExpiryOnTransitionedObject(ctx, objectAPI, t.objInfo, t.restoredObject)
+			} else {
+				applyExpiryOnNonTransitionedObjects(ctx, objectAPI, t.objInfo, t.versionExpiry)
+			}
 		}
 	}()
+	go func() {
+		for t := range globalExpiryState.byNewerNoncurrentCh {
+			deleteObjectVersions(ctx, objectAPI, t.bucket, t.versions)
+		}
+	}()
+}
+
+// newerNoncurrentTask encapsulates arguments required by worker to expire objects
+// by NewerNoncurrentVersions
+type newerNoncurrentTask struct {
+	bucket   string
+	versions []ObjectToDelete
 }
 
 type transitionState struct {
@@ -122,6 +163,11 @@ type transitionState struct {
 	mu         sync.Mutex
 	numWorkers int
 	killCh     chan struct{}
+
+	activeTasks int32
+
+	lastDayMu    sync.RWMutex
+	lastDayStats map[string]*lastDayTierStats
 }
 
 func (t *transitionState) queueTransitionTask(oi ObjectInfo) {
@@ -135,9 +181,7 @@ func (t *transitionState) queueTransitionTask(oi ObjectInfo) {
 	}
 }
 
-var (
-	globalTransitionState *transitionState
-)
+var globalTransitionState *transitionState
 
 func newTransitionState(ctx context.Context, objAPI ObjectLayer) *transitionState {
 	return &transitionState{
@@ -145,7 +189,19 @@ func newTransitionState(ctx context.Context, objAPI ObjectLayer) *transitionStat
 		ctx:          ctx,
 		objAPI:       objAPI,
 		killCh:       make(chan struct{}),
+		lastDayStats: make(map[string]*lastDayTierStats),
 	}
+}
+
+// PendingTasks returns the number of ILM transition tasks waiting for a worker
+// goroutine.
+func (t *transitionState) PendingTasks() int {
+	return len(globalTransitionState.transitionCh)
+}
+
+// ActiveTasks returns the number of active (ongoing) ILM transition tasks.
+func (t *transitionState) ActiveTasks() int {
+	return int(atomic.LoadInt32(&t.activeTasks))
 }
 
 // worker waits for transition tasks
@@ -160,12 +216,46 @@ func (t *transitionState) worker(ctx context.Context, objectAPI ObjectLayer) {
 			if !ok {
 				return
 			}
-
-			if err := transitionObject(ctx, objectAPI, oi); err != nil {
+			atomic.AddInt32(&t.activeTasks, 1)
+			var tier string
+			var err error
+			if tier, err = transitionObject(ctx, objectAPI, oi); err != nil {
 				logger.LogIf(ctx, fmt.Errorf("Transition failed for %s/%s version:%s with %w", oi.Bucket, oi.Name, oi.VersionID, err))
+			} else {
+				ts := tierStats{
+					TotalSize:   uint64(oi.Size),
+					NumVersions: 1,
+				}
+				if oi.IsLatest {
+					ts.NumObjects = 1
+				}
+				t.addLastDayStats(tier, ts)
 			}
+			atomic.AddInt32(&t.activeTasks, -1)
+
 		}
 	}
+}
+
+func (t *transitionState) addLastDayStats(tier string, ts tierStats) {
+	t.lastDayMu.Lock()
+	defer t.lastDayMu.Unlock()
+
+	if _, ok := t.lastDayStats[tier]; !ok {
+		t.lastDayStats[tier] = &lastDayTierStats{}
+	}
+	t.lastDayStats[tier].addStats(ts)
+}
+
+func (t *transitionState) getDailyAllTierStats() dailyAllTierStats {
+	t.lastDayMu.RLock()
+	defer t.lastDayMu.RUnlock()
+
+	res := make(dailyAllTierStats, len(t.lastDayStats))
+	for tier, st := range t.lastDayStats {
+		res[tier] = st.clone()
+	}
+	return res
 }
 
 // UpdateWorkers at the end of this function leaves n goroutines waiting for
@@ -195,14 +285,29 @@ var errInvalidStorageClass = errors.New("invalid storage class")
 
 func validateTransitionTier(lc *lifecycle.Lifecycle) error {
 	for _, rule := range lc.Rules {
-		if rule.Transition.StorageClass == "" {
-			continue
+		if rule.Transition.StorageClass != "" {
+			if valid := globalTierConfigMgr.IsTierValid(rule.Transition.StorageClass); !valid {
+				return errInvalidStorageClass
+			}
 		}
-		if valid := globalTierConfigMgr.IsTierValid(rule.Transition.StorageClass); !valid {
-			return errInvalidStorageClass
+		if rule.NoncurrentVersionTransition.StorageClass != "" {
+			if valid := globalTierConfigMgr.IsTierValid(rule.NoncurrentVersionTransition.StorageClass); !valid {
+				return errInvalidStorageClass
+			}
 		}
 	}
 	return nil
+}
+
+// enqueueTransitionImmediate enqueues obj for transition if eligible.
+// This is to be called after a successful upload of an object (version).
+func enqueueTransitionImmediate(obj ObjectInfo) {
+	if lc, err := globalLifecycleSys.Get(obj.Bucket); err == nil {
+		switch lc.ComputeAction(obj.ToLifecycleOpts()) {
+		case lifecycle.TransitionAction, lifecycle.TransitionVersionAction:
+			globalTransitionState.queueTransitionTask(obj)
+		}
+	}
 }
 
 // expireAction represents different actions to be performed on expiry of a
@@ -227,14 +332,15 @@ func expireTransitionedObject(ctx context.Context, objectAPI ObjectLayer, oi *Ob
 	var opts ObjectOptions
 	opts.Versioned = globalBucketVersioningSys.Enabled(oi.Bucket)
 	opts.VersionID = lcOpts.VersionID
+	opts.Expiration = ExpirationOptions{Expire: true}
 	switch action {
 	case expireObj:
 		// When an object is past expiry or when a transitioned object is being
 		// deleted, 'mark' the data in the remote tier for delete.
 		entry := jentry{
-			ObjName:   oi.transitionedObjName,
-			VersionID: oi.transitionVersionID,
-			TierName:  oi.TransitionTier,
+			ObjName:   oi.TransitionedObject.Name,
+			VersionID: oi.TransitionedObject.VersionID,
+			TierName:  oi.TransitionedObject.Tier,
 		}
 		if err := globalTierJournal.AddEntry(entry); err != nil {
 			logger.LogIf(ctx, err)
@@ -296,27 +402,29 @@ func genTransitionObjName(bucket string) (string, error) {
 // storage specified by the transition ARN, the metadata is left behind on source cluster and original content
 // is moved to the transition tier. Note that in the case of encrypted objects, entire encrypted stream is moved
 // to the transition tier without decrypting or re-encrypting.
-func transitionObject(ctx context.Context, objectAPI ObjectLayer, oi ObjectInfo) error {
+func transitionObject(ctx context.Context, objectAPI ObjectLayer, oi ObjectInfo) (string, error) {
 	lc, err := globalLifecycleSys.Get(oi.Bucket)
 	if err != nil {
-		return err
+		return "", err
 	}
+	tier := lc.TransitionTier(oi.ToLifecycleOpts())
 	opts := ObjectOptions{
 		Transition: TransitionOptions{
 			Status: lifecycle.TransitionPending,
-			Tier:   lc.TransitionTier(oi.ToLifecycleOpts()),
+			Tier:   tier,
 			ETag:   oi.ETag,
 		},
-		VersionID: oi.VersionID,
-		Versioned: globalBucketVersioningSys.Enabled(oi.Bucket),
-		MTime:     oi.ModTime,
+		VersionID:        oi.VersionID,
+		Versioned:        globalBucketVersioningSys.Enabled(oi.Bucket),
+		VersionSuspended: globalBucketVersioningSys.Suspended(oi.Bucket),
+		MTime:            oi.ModTime,
 	}
-	return objectAPI.TransitionObject(ctx, oi.Bucket, oi.Name, opts)
+	return tier, objectAPI.TransitionObject(ctx, oi.Bucket, oi.Name, opts)
 }
 
 // getTransitionedObjectReader returns a reader from the transitioned tier.
 func getTransitionedObjectReader(ctx context.Context, bucket, object string, rs *HTTPRangeSpec, h http.Header, oi ObjectInfo, opts ObjectOptions) (gr *GetObjectReader, err error) {
-	tgtClient, err := globalTierConfigMgr.getDriver(oi.TransitionTier)
+	tgtClient, err := globalTierConfigMgr.getDriver(oi.TransitionedObject.Tier)
 	if err != nil {
 		return nil, fmt.Errorf("transition storage class not configured")
 	}
@@ -333,7 +441,7 @@ func getTransitionedObjectReader(ctx context.Context, bucket, object string, rs 
 		gopts.length = length
 	}
 
-	reader, err := tgtClient.Get(ctx, oi.transitionedObjName, remoteVersionID(oi.transitionVersionID), gopts)
+	reader, err := tgtClient.Get(ctx, oi.TransitionedObject.Name, remoteVersionID(oi.TransitionedObject.VersionID), gopts)
 	if err != nil {
 		return nil, err
 	}
@@ -353,9 +461,9 @@ const (
 
 // Encryption specifies encryption setting on restored bucket
 type Encryption struct {
-	EncryptionType sse.SSEAlgorithm `xml:"EncryptionType"`
-	KMSContext     string           `xml:"KMSContext,omitempty"`
-	KMSKeyID       string           `xml:"KMSKeyId,omitempty"`
+	EncryptionType sse.Algorithm `xml:"EncryptionType"`
+	KMSContext     string        `xml:"KMSContext,omitempty"`
+	KMSKeyID       string        `xml:"KMSKeyId,omitempty"`
 }
 
 // MetadataEntry denotes name and value.
@@ -394,9 +502,7 @@ func (sp *SelectParameters) IsEmpty() bool {
 	return sp == nil
 }
 
-var (
-	selectParamsXMLName = "SelectParameters"
-)
+var selectParamsXMLName = "SelectParameters"
 
 // UnmarshalXML - decodes XML data.
 func (sp *SelectParameters) UnmarshalXML(d *xml.Decoder, start xml.StartElement) error {
@@ -508,7 +614,7 @@ func putRestoreOpts(bucket, object string, rreq *RestoreObjectRequest, objInfo O
 
 	if rreq.Type == SelectRestoreRequest {
 		for _, v := range rreq.OutputLocation.S3.UserMetadata {
-			if !strings.HasPrefix("x-amz-meta", strings.ToLower(v.Name)) {
+			if !strings.HasPrefix(strings.ToLower(v.Name), "x-amz-meta") {
 				meta["x-amz-meta-"+v.Name] = v.Value
 				continue
 			}
@@ -557,7 +663,7 @@ func (fi FileInfo) IsRemote() bool {
 // IsRemote returns true if this object version's contents are in its remote
 // tier.
 func (oi ObjectInfo) IsRemote() bool {
-	if oi.TransitionStatus != lifecycle.TransitionComplete {
+	if oi.TransitionedObject.Status != lifecycle.TransitionComplete {
 		return false
 	}
 	return !isRestoredObjectOnDisk(oi.UserDefined)
@@ -588,9 +694,9 @@ func completedRestoreObj(expiry time.Time) restoreObjStatus {
 // String returns x-amz-restore compatible representation of r.
 func (r restoreObjStatus) String() string {
 	if r.Ongoing() {
-		return "ongoing-request=true"
+		return `ongoing-request="true"`
 	}
-	return fmt.Sprintf("ongoing-request=false, expiry-date=%s", r.expiry.Format(http.TimeFormat))
+	return fmt.Sprintf(`ongoing-request="false", expiry-date="%s"`, r.expiry.Format(http.TimeFormat))
 }
 
 // Expiry returns expiry of restored object and true if restore-object has completed.
@@ -634,12 +740,11 @@ func parseRestoreObjStatus(restoreHdr string) (restoreObjStatus, error) {
 	}
 
 	switch progressTokens[1] {
-	case "true":
+	case "true", `"true"`: // true without double quotes is deprecated in Feb 2022
 		if len(tokens) == 1 {
 			return ongoingRestoreObj(), nil
 		}
-
-	case "false":
+	case "false", `"false"`: // false without double quotes is deprecated in Feb 2022
 		if len(tokens) != 2 {
 			return restoreObjStatus{}, errRestoreHDRMalformed
 		}
@@ -650,8 +755,7 @@ func parseRestoreObjStatus(restoreHdr string) (restoreObjStatus, error) {
 		if strings.TrimSpace(expiryTokens[0]) != "expiry-date" {
 			return restoreObjStatus{}, errRestoreHDRMalformed
 		}
-
-		expiry, err := time.Parse(http.TimeFormat, expiryTokens[1])
+		expiry, err := time.Parse(http.TimeFormat, strings.Trim(expiryTokens[1], `"`))
 		if err != nil {
 			return restoreObjStatus{}, errRestoreHDRMalformed
 		}
@@ -675,17 +779,16 @@ func isRestoredObjectOnDisk(meta map[string]string) (onDisk bool) {
 // ToLifecycleOpts returns lifecycle.ObjectOpts value for oi.
 func (oi ObjectInfo) ToLifecycleOpts() lifecycle.ObjectOpts {
 	return lifecycle.ObjectOpts{
-		Name:                   oi.Name,
-		UserTags:               oi.UserTags,
-		VersionID:              oi.VersionID,
-		ModTime:                oi.ModTime,
-		IsLatest:               oi.IsLatest,
-		NumVersions:            oi.NumVersions,
-		DeleteMarker:           oi.DeleteMarker,
-		SuccessorModTime:       oi.SuccessorModTime,
-		RestoreOngoing:         oi.RestoreOngoing,
-		RestoreExpires:         oi.RestoreExpires,
-		TransitionStatus:       oi.TransitionStatus,
-		RemoteTiersImmediately: globalDebugRemoteTiersImmediately,
+		Name:             oi.Name,
+		UserTags:         oi.UserTags,
+		VersionID:        oi.VersionID,
+		ModTime:          oi.ModTime,
+		IsLatest:         oi.IsLatest,
+		NumVersions:      oi.NumVersions,
+		DeleteMarker:     oi.DeleteMarker,
+		SuccessorModTime: oi.SuccessorModTime,
+		RestoreOngoing:   oi.RestoreOngoing,
+		RestoreExpires:   oi.RestoreExpires,
+		TransitionStatus: oi.TransitionedObject.Status,
 	}
 }

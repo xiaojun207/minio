@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strings"
 
 	"github.com/bcicen/jstream"
 	"github.com/minio/simdjson-go"
@@ -69,6 +70,9 @@ func (e *Expression) evalNode(r Record, tableAlias string) (*Value, error) {
 		if !ok {
 			return nil, errExpectedBool
 		}
+		if b {
+			return FromBool(true), nil
+		}
 		result = result || b
 	}
 	return FromBool(result), nil
@@ -90,6 +94,9 @@ func (e *AndCondition) evalNode(r Record, tableAlias string) (*Value, error) {
 		b, ok := res.ToBool()
 		if !ok {
 			return nil, errExpectedBool
+		}
+		if !b {
+			return FromBool(false), nil
 		}
 		result = result && b
 	}
@@ -128,7 +135,7 @@ func (e *ConditionOperand) evalNode(r Record, tableAlias string) (*Value, error)
 			return nil, cmpRErr
 		}
 
-		b, err := opVal.compareOp(e.ConditionRHS.Compare.Operator, cmpRight)
+		b, err := opVal.compareOp(strings.ToUpper(e.ConditionRHS.Compare.Operator), cmpRight)
 		return FromBool(b), err
 
 	case e.ConditionRHS.Between != nil:
@@ -442,6 +449,8 @@ func jsonToValue(result interface{}) (*Value, error) {
 		return FromArray(rval), nil
 	case nil:
 		return FromNull(), nil
+	case Missing:
+		return FromMissing(), nil
 	}
 	return nil, fmt.Errorf("Unhandled value type: %T", result)
 }
@@ -486,6 +495,8 @@ func (e *LitValue) evalNode(_ Record) (res *Value, err error) {
 		return FromString(string(*e.String)), nil
 	case e.Boolean != nil:
 		return FromBool(bool(*e.Boolean)), nil
+	case e.Missing:
+		return FromMissing(), nil
 	}
 	return FromNull(), nil
 }

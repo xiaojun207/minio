@@ -51,10 +51,8 @@ const (
 	updateTimeout     = 10 * time.Second
 )
 
-var (
-	// For windows our files have .exe additionally.
-	minioReleaseWindowsInfoURL = minioReleaseURL + "minio.exe.sha256sum"
-)
+// For windows our files have .exe additionally.
+var minioReleaseWindowsInfoURL = minioReleaseURL + "minio.exe.sha256sum"
 
 // minioVersionToReleaseTime - parses a standard official release
 // MinIO version string.
@@ -126,7 +124,7 @@ func GetCurrentReleaseTime() (releaseTime time.Time, err error) {
 //     "/.dockerenv":      "file",
 //
 func IsDocker() bool {
-	if env.Get("MINIO_CI_CD", "") == "" {
+	if !globalIsCICD {
 		_, err := os.Stat("/.dockerenv")
 		if osIsNotExist(err) {
 			return false
@@ -142,7 +140,7 @@ func IsDocker() bool {
 
 // IsDCOS returns true if minio is running in DCOS.
 func IsDCOS() bool {
-	if env.Get("MINIO_CI_CD", "") == "" {
+	if !globalIsCICD {
 		// http://mesos.apache.org/documentation/latest/docker-containerizer/
 		// Mesos docker containerizer sets this value
 		return env.Get("MESOS_CONTAINER_NAME", "") != ""
@@ -152,7 +150,7 @@ func IsDCOS() bool {
 
 // IsKubernetes returns true if minio is running in kubernetes.
 func IsKubernetes() bool {
-	if env.Get("MINIO_CI_CD", "") == "" {
+	if !globalIsCICD {
 		// Kubernetes env used to validate if we are
 		// indeed running inside a kubernetes pod
 		// is KUBERNETES_SERVICE_HOST
@@ -225,7 +223,6 @@ func IsPCFTile() bool {
 // Any change here should be discussed by opening an issue at
 // https://github.com/minio/minio/issues.
 func getUserAgent(mode string) string {
-
 	userAgentParts := []string{}
 	// Helper function to concisely append a pair of strings to a
 	// the user-agent slice.
@@ -420,7 +417,8 @@ func getUpdateTransport(timeout time.Duration) http.RoundTripper {
 		TLSHandshakeTimeout:   timeout,
 		ExpectContinueTimeout: timeout,
 		TLSClientConfig: &tls.Config{
-			RootCAs: globalRootCAs,
+			RootCAs:            globalRootCAs,
+			ClientSessionCache: tls.NewLRUClientSessionCache(tlsClientSessionCacheSize),
 		},
 		DisableCompression: true,
 	}
@@ -461,7 +459,7 @@ func getDownloadURL(releaseTag string) (downloadURL string) {
 	// Check if we are docker environment, return docker update command
 	if IsDocker() {
 		// Construct release tag name.
-		return fmt.Sprintf("podman pull minio/minio:%s", releaseTag)
+		return fmt.Sprintf("podman pull quay.io/minio/minio:%s", releaseTag)
 	}
 
 	// For binary only installations, we return link to the latest binary.
@@ -535,6 +533,14 @@ func doUpdate(u *url.URL, lrTime time.Time, sha256Sum []byte, releaseInfo string
 	opts := selfupdate.Options{
 		Hash:     crypto.SHA256,
 		Checksum: sha256Sum,
+	}
+
+	if err := opts.CheckPermissions(); err != nil {
+		return AdminError{
+			Code:       AdminUpdateApplyFailure,
+			Message:    fmt.Sprintf("server update failed with: %s, do not restart the servers yet", err),
+			StatusCode: http.StatusInternalServerError,
+		}
 	}
 
 	minisignPubkey := env.Get(envMinisignPubKey, "")

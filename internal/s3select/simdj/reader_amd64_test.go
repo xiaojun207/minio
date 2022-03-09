@@ -67,7 +67,6 @@ func TestNDJSON(t *testing.T) {
 	}
 
 	for _, tt := range testCases {
-
 		t.Run(tt.name, func(t *testing.T) {
 			ref := loadCompressed(t, tt.name)
 
@@ -87,7 +86,7 @@ func TestNDJSON(t *testing.T) {
 			if false {
 				t.Log(string(b))
 			}
-			//_ = ioutil.WriteFile(filepath.Join("testdata", tt.name+".json"), b, os.ModePerm)
+			// _ = ioutil.WriteFile(filepath.Join("testdata", tt.name+".json"), b, os.ModePerm)
 
 		parser:
 			for {

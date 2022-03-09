@@ -84,7 +84,6 @@ func TestJSONPath(t *testing.T) {
 		}
 		// repr.Println(j, repr.Indent("  "), repr.OmitEmpty(true))
 	}
-
 }
 
 func TestIdentifierParsing(t *testing.T) {
@@ -332,6 +331,7 @@ func TestFromClauseJSONPath(t *testing.T) {
 		"select * from s3object[*].books[*].name as s",
 		"select * from s3object s where name > 2",
 		"select * from s3object[*].name as s where name > 2",
+		"select * from s3object[*].books[*] limit 1",
 	}
 	for i, tc := range cases {
 		err := p.ParseString(tc, &s)
@@ -341,7 +341,6 @@ func TestFromClauseJSONPath(t *testing.T) {
 
 		// repr.Println(s, repr.Indent("  "), repr.OmitEmpty(true))
 	}
-
 }
 
 func TestSelectParsing(t *testing.T) {

@@ -20,9 +20,11 @@ package cmd
 import (
 	"context"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 
 	"github.com/Azure/azure-storage-blob-go/azblob"
@@ -80,6 +82,7 @@ const (
 	ErrIncompleteBody
 	ErrInternalError
 	ErrInvalidAccessKeyID
+	ErrAccessKeyDisabled
 	ErrInvalidBucketName
 	ErrInvalidDigest
 	ErrInvalidRange
@@ -107,6 +110,7 @@ const (
 	ErrNoSuchBucketPolicy
 	ErrNoSuchBucketLifecycle
 	ErrNoSuchLifecycleConfiguration
+	ErrInvalidLifecycleWithObjectLock
 	ErrNoSuchBucketSSEConfig
 	ErrNoSuchCORSConfiguration
 	ErrNoSuchWebsiteConfiguration
@@ -126,6 +130,7 @@ const (
 	ErrReplicationSourceNotVersionedError
 	ErrReplicationNeedsVersioningError
 	ErrReplicationBucketNeedsVersioningError
+	ErrReplicationDenyEditError
 	ErrReplicationNoMatchingRuleError
 	ErrObjectRestoreAlreadyInProgress
 	ErrNoSuchKey
@@ -207,6 +212,7 @@ const (
 	ErrInvalidSSECustomerParameters
 	ErrIncompatibleEncryptionMethod
 	ErrKMSNotConfigured
+	ErrKMSKeyNotFoundException
 
 	ErrNoAccessKey
 	ErrInvalidToken
@@ -265,6 +271,16 @@ const (
 	ErrAdminCredentialsMismatch
 	ErrInsecureClientRequest
 	ErrObjectTampered
+
+	// Site-Replication errors
+	ErrSiteReplicationInvalidRequest
+	ErrSiteReplicationPeerResp
+	ErrSiteReplicationBackendIssue
+	ErrSiteReplicationServiceAccountError
+	ErrSiteReplicationBucketConfigError
+	ErrSiteReplicationBucketMetaError
+	ErrSiteReplicationIAMError
+
 	// Bucket Quota error codes
 	ErrAdminBucketQuotaExceeded
 	ErrAdminNoSuchQuotaConfiguration
@@ -383,10 +399,10 @@ func (e errorCodeMap) ToAPIErrWithErr(errCode APIErrorCode, err error) APIError 
 	if err != nil {
 		apiErr.Description = fmt.Sprintf("%s (%s)", apiErr.Description, err)
 	}
-	if globalServerRegion != "" {
+	if globalSite.Region != "" {
 		switch errCode {
 		case ErrAuthorizationHeaderMalformed:
-			apiErr.Description = fmt.Sprintf("The authorization header is malformed; the region is wrong; expecting '%s'.", globalServerRegion)
+			apiErr.Description = fmt.Sprintf("The authorization header is malformed; the region is wrong; expecting '%s'.", globalSite.Region)
 			return apiErr
 		}
 	}
@@ -442,7 +458,7 @@ var errorCodes = errorCodeMap{
 	},
 	ErrInvalidMaxParts: {
 		Code:           "InvalidArgument",
-		Description:    "Argument max-parts must be an integer between 0 and 2147483647",
+		Description:    "Part number must be an integer between 1 and 10000, inclusive",
 		HTTPStatusCode: http.StatusBadRequest,
 	},
 	ErrInvalidPartNumberMarker: {
@@ -498,6 +514,11 @@ var errorCodes = errorCodeMap{
 	ErrInvalidAccessKeyID: {
 		Code:           "InvalidAccessKeyId",
 		Description:    "The Access Key Id you provided does not exist in our records.",
+		HTTPStatusCode: http.StatusForbidden,
+	},
+	ErrAccessKeyDisabled: {
+		Code:           "InvalidAccessKeyId",
+		Description:    "Your account is disabled; please contact your administrator.",
 		HTTPStatusCode: http.StatusForbidden,
 	},
 	ErrInvalidBucketName: {
@@ -564,6 +585,11 @@ var errorCodes = errorCodeMap{
 		Code:           "NoSuchLifecycleConfiguration",
 		Description:    "The lifecycle configuration does not exist",
 		HTTPStatusCode: http.StatusNotFound,
+	},
+	ErrInvalidLifecycleWithObjectLock: {
+		Code:           "InvalidLifecycleWithObjectLock",
+		Description:    "The lifecycle configuration containing MaxNoncurrentVersions is not supported with object locking",
+		HTTPStatusCode: http.StatusBadRequest,
 	},
 	ErrNoSuchBucketSSEConfig: {
 		Code:           "ServerSideEncryptionConfigurationNotFoundError",
@@ -662,7 +688,7 @@ var errorCodes = errorCodeMap{
 	},
 	ErrAllAccessDisabled: {
 		Code:           "AllAccessDisabled",
-		Description:    "All access to this bucket has been disabled.",
+		Description:    "All access to this resource has been disabled.",
 		HTTPStatusCode: http.StatusForbidden,
 	},
 	ErrMalformedPolicy: {
@@ -870,6 +896,11 @@ var errorCodes = errorCodeMap{
 		Description:    "No matching replication rule found for this object prefix",
 		HTTPStatusCode: http.StatusBadRequest,
 	},
+	ErrReplicationDenyEditError: {
+		Code:           "XMinioReplicationDenyEdit",
+		Description:    "Cannot alter local replication config since this server is in a cluster replication setup",
+		HTTPStatusCode: http.StatusConflict,
+	},
 	ErrBucketRemoteIdenticalToSource: {
 		Code:           "XMinioAdminRemoteIdenticalToSource",
 		Description:    "The remote target cannot be identical to source",
@@ -961,7 +992,7 @@ var errorCodes = errorCodeMap{
 		HTTPStatusCode: http.StatusNotFound,
 	},
 
-	/// Bucket notification related errors.
+	// Bucket notification related errors.
 	ErrEventNotification: {
 		Code:           "InvalidArgument",
 		Description:    "A specified event is not supported for notifications.",
@@ -1097,6 +1128,11 @@ var errorCodes = errorCodeMap{
 		Description:    "Server side encryption specified but KMS is not configured",
 		HTTPStatusCode: http.StatusNotImplemented,
 	},
+	ErrKMSKeyNotFoundException: {
+		Code:           "KMS.NotFoundException",
+		Description:    "Invalid keyId",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
 	ErrNoAccessKey: {
 		Code:           "AccessDenied",
 		Description:    "No AWSAccessKey was presented",
@@ -1108,14 +1144,14 @@ var errorCodes = errorCodeMap{
 		HTTPStatusCode: http.StatusForbidden,
 	},
 
-	/// S3 extensions.
+	// S3 extensions.
 	ErrContentSHA256Mismatch: {
 		Code:           "XAmzContentSHA256Mismatch",
 		Description:    "The provided 'x-amz-content-sha256' header does not match what was computed.",
 		HTTPStatusCode: http.StatusBadRequest,
 	},
 
-	/// MinIO extensions.
+	// MinIO extensions.
 	ErrStorageFull: {
 		Code:           "XMinioStorageFull",
 		Description:    "Storage backend has reached its minimum free disk threshold. Please delete a few objects to proceed.",
@@ -1267,6 +1303,43 @@ var errorCodes = errorCodeMap{
 		Description:    errObjectTampered.Error(),
 		HTTPStatusCode: http.StatusPartialContent,
 	},
+
+	ErrSiteReplicationInvalidRequest: {
+		Code:           "XMinioSiteReplicationInvalidRequest",
+		Description:    "Invalid site-replication request",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+	ErrSiteReplicationPeerResp: {
+		Code:           "XMinioSiteReplicationPeerResp",
+		Description:    "Error received when contacting a peer site",
+		HTTPStatusCode: http.StatusServiceUnavailable,
+	},
+	ErrSiteReplicationBackendIssue: {
+		Code:           "XMinioSiteReplicationBackendIssue",
+		Description:    "Error when requesting object layer backend",
+		HTTPStatusCode: http.StatusServiceUnavailable,
+	},
+	ErrSiteReplicationServiceAccountError: {
+		Code:           "XMinioSiteReplicationServiceAccountError",
+		Description:    "Site replication related service account error",
+		HTTPStatusCode: http.StatusServiceUnavailable,
+	},
+	ErrSiteReplicationBucketConfigError: {
+		Code:           "XMinioSiteReplicationBucketConfigError",
+		Description:    "Error while configuring replication on a bucket",
+		HTTPStatusCode: http.StatusServiceUnavailable,
+	},
+	ErrSiteReplicationBucketMetaError: {
+		Code:           "XMinioSiteReplicationBucketMetaError",
+		Description:    "Error while replicating bucket metadata",
+		HTTPStatusCode: http.StatusServiceUnavailable,
+	},
+	ErrSiteReplicationIAMError: {
+		Code:           "XMinioSiteReplicationIAMError",
+		Description:    "Error while replicating an IAM item",
+		HTTPStatusCode: http.StatusServiceUnavailable,
+	},
+
 	ErrMaximumExpires: {
 		Code:           "AuthorizationQueryParametersError",
 		Description:    "X-Amz-Expires must be less than a week (in seconds); that is, the given X-Amz-Expires must be less than 604800 seconds",
@@ -1313,15 +1386,15 @@ var errorCodes = errorCodeMap{
 	},
 	ErrBackendDown: {
 		Code:           "XMinioBackendDown",
-		Description:    "Object storage backend is unreachable",
-		HTTPStatusCode: http.StatusServiceUnavailable,
+		Description:    "Remote backend is unreachable",
+		HTTPStatusCode: http.StatusBadRequest,
 	},
 	ErrIncorrectContinuationToken: {
 		Code:           "InvalidArgument",
 		Description:    "The continuation token provided is incorrect",
 		HTTPStatusCode: http.StatusBadRequest,
 	},
-	//S3 Select API Errors
+	// S3 Select API Errors
 	ErrEmptyRequestBody: {
 		Code:           "EmptyRequestBody",
 		Description:    "Request body cannot be empty.",
@@ -1785,12 +1858,10 @@ func toAPIErrorCode(ctx context.Context, err error) (apiErr APIErrorCode) {
 
 	// Only return ErrClientDisconnected if the provided context is actually canceled.
 	// This way downstream context.Canceled will still report ErrOperationTimedOut
-	select {
-	case <-ctx.Done():
+	if contextCanceled(ctx) {
 		if ctx.Err() == context.Canceled {
 			return ErrClientDisconnected
 		}
-	default:
 	}
 
 	switch err {
@@ -1847,6 +1918,9 @@ func toAPIErrorCode(ctx context.Context, err error) (apiErr APIErrorCode) {
 		apiErr = ErrIncompatibleEncryptionMethod
 	case errKMSNotConfigured:
 		apiErr = ErrKMSNotConfigured
+	case errKMSKeyNotFound:
+		apiErr = ErrKMSKeyNotFoundException
+
 	case context.Canceled, context.DeadlineExceeded:
 		apiErr = ErrOperationTimedOut
 	case errDiskNotFound:
@@ -1909,6 +1983,8 @@ func toAPIErrorCode(ctx context.Context, err error) (apiErr APIErrorCode) {
 		apiErr = ErrNoSuchKey
 	case MethodNotAllowed:
 		apiErr = ErrMethodNotAllowed
+	case ObjectLocked:
+		apiErr = ErrObjectLocked
 	case InvalidVersionID:
 		apiErr = ErrInvalidVersionID
 	case VersionNotFound:
@@ -1965,8 +2041,6 @@ func toAPIErrorCode(ctx context.Context, err error) (apiErr APIErrorCode) {
 		apiErr = ErrReplicationConfigurationNotFoundError
 	case BucketRemoteDestinationNotFound:
 		apiErr = ErrRemoteDestinationNotFoundError
-	case BucketReplicationDestinationMissingLock:
-		apiErr = ErrReplicationDestinationMissingLock
 	case BucketRemoteTargetNotFound:
 		apiErr = ErrRemoteTargetNotFoundError
 	case BucketRemoteConnectionErr:
@@ -2027,6 +2101,7 @@ func toAPIErrorCode(ctx context.Context, err error) (apiErr APIErrorCode) {
 	default:
 		var ie, iw int
 		// This work-around is to handle the issue golang/go#30648
+		//nolint:gocritic
 		if _, ferr := fmt.Fscanf(strings.NewReader(err.Error()),
 			"request declared a Content-Length of %d but only wrote %d bytes",
 			&ie, &iw); ferr != nil {
@@ -2059,7 +2134,7 @@ func toAPIError(ctx context.Context, err error) APIError {
 		return noError
 	}
 
-	var apiErr = errorCodes.ToAPIErr(toAPIErrorCode(ctx, err))
+	apiErr := errorCodes.ToAPIErr(toAPIErrorCode(ctx, err))
 	e, ok := err.(dns.ErrInvalidBucketName)
 	if ok {
 		code := toAPIErrorCode(ctx, e)
@@ -2080,6 +2155,11 @@ func toAPIError(ctx context.Context, err error) APIError {
 			}
 			return apiErr
 		}
+	}
+
+	if apiErr.Code == "XMinioBackendDown" {
+		apiErr.Description = fmt.Sprintf("%s (%v)", apiErr.Description, err)
+		return apiErr
 	}
 
 	if apiErr.Code == "InternalError" {
@@ -2167,7 +2247,6 @@ func toAPIError(ctx context.Context, err error) APIError {
 			// since S3 only sends one Error XML response.
 			if len(e.Errors) >= 1 {
 				apiErr.Code = e.Errors[0].Reason
-
 			}
 		case azblob.StorageError:
 			apiErr = APIError{
@@ -2177,10 +2256,31 @@ func toAPIError(ctx context.Context, err error) APIError {
 			}
 			// Add more Gateway SDKs here if any in future.
 		default:
-			apiErr = APIError{
-				Code:           apiErr.Code,
-				Description:    fmt.Sprintf("%s: cause(%v)", apiErr.Description, err),
-				HTTPStatusCode: apiErr.HTTPStatusCode,
+			//nolint:gocritic
+			if errors.Is(err, errMalformedEncoding) {
+				apiErr = APIError{
+					Code:           "BadRequest",
+					Description:    err.Error(),
+					HTTPStatusCode: http.StatusBadRequest,
+				}
+			} else if errors.Is(err, errChunkTooBig) {
+				apiErr = APIError{
+					Code:           "BadRequest",
+					Description:    err.Error(),
+					HTTPStatusCode: http.StatusBadRequest,
+				}
+			} else if errors.Is(err, strconv.ErrRange) {
+				apiErr = APIError{
+					Code:           "BadRequest",
+					Description:    err.Error(),
+					HTTPStatusCode: http.StatusBadRequest,
+				}
+			} else {
+				apiErr = APIError{
+					Code:           apiErr.Code,
+					Description:    fmt.Sprintf("%s: cause(%v)", apiErr.Description, err),
+					HTTPStatusCode: apiErr.HTTPStatusCode,
+				}
 			}
 		}
 	}
@@ -2206,7 +2306,7 @@ func getAPIErrorResponse(ctx context.Context, err APIError, resource, requestID,
 		BucketName: reqInfo.BucketName,
 		Key:        reqInfo.ObjectName,
 		Resource:   resource,
-		Region:     globalServerRegion,
+		Region:     globalSite.Region,
 		RequestID:  requestID,
 		HostID:     hostID,
 	}

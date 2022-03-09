@@ -110,10 +110,9 @@ func cacheControlOpts(o ObjectInfo) *cacheControl {
 
 	var headerVal string
 	for k, v := range m {
-		if strings.ToLower(k) == "cache-control" {
+		if strings.EqualFold(k, "cache-control") {
 			headerVal = v
 		}
-
 	}
 	if headerVal == "" {
 		return nil
@@ -246,6 +245,9 @@ func decryptCacheObjectETag(info *ObjectInfo) error {
 		if globalCacheKMS == nil {
 			return errKMSNotConfigured
 		}
+		if len(info.Parts) > 0 { // multipart ETag is not encrypted since it is not md5sum
+			return nil
+		}
 		keyID, kmsKey, sealedKey, err := crypto.S3.ParseMetadata(info.UserDefined)
 		if err != nil {
 			return err
@@ -269,6 +271,43 @@ func decryptCacheObjectETag(info *ObjectInfo) error {
 	}
 
 	return nil
+}
+
+// decryptCacheObjectETag tries to decrypt the ETag saved in encrypted format using the cache KMS
+func decryptCachePartETags(c *cacheMeta) ([]string, error) {
+	var partETags []string
+	encrypted := crypto.S3.IsEncrypted(c.Meta) && isCacheEncrypted(c.Meta)
+
+	switch {
+	case encrypted:
+		if globalCacheKMS == nil {
+			return partETags, errKMSNotConfigured
+		}
+		keyID, kmsKey, sealedKey, err := crypto.S3.ParseMetadata(c.Meta)
+		if err != nil {
+			return partETags, err
+		}
+		extKey, err := globalCacheKMS.DecryptKey(keyID, kmsKey, kms.Context{c.Bucket: path.Join(c.Bucket, c.Object)})
+		if err != nil {
+			return partETags, err
+		}
+		var objectKey crypto.ObjectKey
+		if err = objectKey.Unseal(extKey, sealedKey, crypto.S3.String(), c.Bucket, c.Object); err != nil {
+			return partETags, err
+		}
+		for i := range c.PartETags {
+			etagStr := tryDecryptETag(objectKey[:], c.PartETags[i], false)
+			// backend ETag was hex encoded before encrypting, so hex decode to get actual ETag
+			etag, err := hex.DecodeString(etagStr)
+			if err != nil {
+				return []string{}, err
+			}
+			partETags = append(partETags, string(etag))
+		}
+		return partETags, nil
+	default:
+		return c.PartETags, nil
+	}
 }
 
 func isMetadataSame(m1, m2 map[string]string) bool {
@@ -379,6 +418,9 @@ func (f *fileScorer) addFileWithObjInfo(objInfo ObjectInfo, hits int) {
 // Returns true if there still is a need to delete files (n+saveBytes >0),
 // false if no more bytes needs to be saved.
 func (f *fileScorer) adjustSaveBytes(n int64) bool {
+	if f == nil {
+		return false
+	}
 	if int64(f.saveBytes)+n <= 0 {
 		f.saveBytes = 0
 		f.trimQueue()
@@ -435,22 +477,6 @@ func (f *fileScorer) trimQueue() {
 	}
 }
 
-// fileObjInfos returns all queued file object infos
-func (f *fileScorer) fileObjInfos() []ObjectInfo {
-	res := make([]ObjectInfo, 0, f.queue.Len())
-	e := f.queue.Front()
-	for e != nil {
-		qfile := e.Value.(queuedFile)
-		res = append(res, ObjectInfo{
-			Name:      qfile.name,
-			Size:      int64(qfile.size),
-			VersionID: qfile.versionID,
-		})
-		e = e.Next()
-	}
-	return res
-}
-
 func (f *fileScorer) purgeFunc(p func(qfile queuedFile)) {
 	e := f.queue.Front()
 	for e != nil {
@@ -505,4 +531,51 @@ func bytesToClear(total, free int64, quotaPct, lowWatermark, highWatermark uint6
 	// Return bytes needed to reach low watermark.
 	lowWMUsage := total * (int64)(lowWatermark*quotaPct) / (100 * 100)
 	return (uint64)(math.Min(float64(quotaAllowed), math.Max(0.0, float64(used-lowWMUsage))))
+}
+
+type multiWriter struct {
+	backendWriter io.Writer
+	cacheWriter   *io.PipeWriter
+	pipeClosed    bool
+}
+
+// multiWriter writes to backend and cache - if cache write
+// fails close the pipe, but continue writing to the backend
+func (t *multiWriter) Write(p []byte) (n int, err error) {
+	n, err = t.backendWriter.Write(p)
+	if err == nil && n != len(p) {
+		err = io.ErrShortWrite
+		return
+	}
+	if err != nil {
+		if !t.pipeClosed {
+			t.cacheWriter.CloseWithError(err)
+		}
+		return
+	}
+
+	// ignore errors writing to cache
+	if !t.pipeClosed {
+		_, cerr := t.cacheWriter.Write(p)
+		if cerr != nil {
+			t.pipeClosed = true
+			t.cacheWriter.CloseWithError(cerr)
+		}
+	}
+	return len(p), nil
+}
+
+func cacheMultiWriter(w1 io.Writer, w2 *io.PipeWriter) io.Writer {
+	return &multiWriter{backendWriter: w1, cacheWriter: w2}
+}
+
+// writebackInProgress returns true if writeback commit is not complete
+func writebackInProgress(m map[string]string) bool {
+	if v, ok := m[writeBackStatusHeader]; ok {
+		switch cacheCommitStatus(v) {
+		case CommitPending, CommitFailed:
+			return true
+		}
+	}
+	return false
 }

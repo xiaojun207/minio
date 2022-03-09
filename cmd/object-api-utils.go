@@ -61,10 +61,7 @@ const (
 	// MinIO tmp meta prefix.
 	minioMetaTmpBucket = minioMetaBucket + "/tmp"
 	// MinIO tmp meta prefix for deleted objects.
-	minioMetaTmpDeletedBucket      = minioMetaTmpBucket + "/.trash"
-	minioMetaSpeedTestBucket       = minioMetaBucket + "/speedtest"
-	minioMetaSpeedTestBucketPrefix = "objects/"
-
+	minioMetaTmpDeletedBucket = minioMetaTmpBucket + "/.trash"
 	// DNS separator (period), used for bucket name validation.
 	dnsDelimiter = "."
 	// On compressed files bigger than this;
@@ -263,7 +260,7 @@ func cleanMetadata(metadata map[string]string) map[string]string {
 	// Remove STANDARD StorageClass
 	metadata = removeStandardStorageClass(metadata)
 	// Clean meta etag keys 'md5Sum', 'etag', "expires", "x-amz-tagging".
-	return cleanMetadataKeys(metadata, "md5Sum", "etag", "expires", xhttp.AmzObjectTagging, "last-modified")
+	return cleanMetadataKeys(metadata, "md5Sum", "etag", "expires", xhttp.AmzObjectTagging, "last-modified", VersionPurgeStatusKey)
 }
 
 // Filter X-Amz-Storage-Class field only if it is set to STANDARD.
@@ -278,7 +275,7 @@ func removeStandardStorageClass(metadata map[string]string) map[string]string {
 // cleanMetadataKeys takes keyNames to be filtered
 // and returns a new map with all the entries with keyNames removed.
 func cleanMetadataKeys(metadata map[string]string, keyNames ...string) map[string]string {
-	var newMeta = make(map[string]string, len(metadata))
+	newMeta := make(map[string]string, len(metadata))
 	for k, v := range metadata {
 		if contains(keyNames, k) {
 			continue
@@ -290,10 +287,10 @@ func cleanMetadataKeys(metadata map[string]string, keyNames ...string) map[strin
 
 // Extracts etag value from the metadata.
 func extractETag(metadata map[string]string) string {
-	// md5Sum tag is kept for backward compatibility.
-	etag, ok := metadata["md5Sum"]
+	etag, ok := metadata["etag"]
 	if !ok {
-		etag = metadata["etag"]
+		// md5Sum tag is kept for backward compatibility.
+		etag = metadata["md5Sum"]
 	}
 	// Success.
 	return etag
@@ -513,7 +510,7 @@ func partNumberToRangeSpec(oi ObjectInfo, partNumber int) *HTTPRangeSpec {
 	}
 
 	var start int64
-	var end = int64(-1)
+	end := int64(-1)
 	for i := 0; i < len(oi.Parts) && i < partNumber; i++ {
 		start = end + 1
 		end = start + oi.Parts[i].ActualSize - 1
@@ -591,8 +588,8 @@ type ObjReaderFn func(inputReader io.Reader, h http.Header, cleanupFns ...func()
 // assumed that clean up functions do not panic (otherwise, they may
 // not all run!).
 func NewGetObjectReader(rs *HTTPRangeSpec, oi ObjectInfo, opts ObjectOptions) (
-	fn ObjReaderFn, off, length int64, err error) {
-
+	fn ObjReaderFn, off, length int64, err error,
+) {
 	if opts.CheckPrecondFn != nil && opts.CheckPrecondFn(oi) {
 		return nil, 0, 0, PreConditionFailed{}
 	}
@@ -790,7 +787,7 @@ func (g *GetObjectReader) Close() error {
 	return nil
 }
 
-//SealMD5CurrFn seals md5sum with object encryption key and returns sealed
+// SealMD5CurrFn seals md5sum with object encryption key and returns sealed
 // md5sum
 type SealMD5CurrFn func([]byte) []byte
 
@@ -873,7 +870,7 @@ func sealETagFn(key crypto.ObjectKey) SealMD5CurrFn {
 // CleanMinioInternalMetadataKeys removes X-Amz-Meta- prefix from minio internal
 // encryption metadata that was sent by minio gateway
 func CleanMinioInternalMetadataKeys(metadata map[string]string) map[string]string {
-	var newMeta = make(map[string]string, len(metadata))
+	newMeta := make(map[string]string, len(metadata))
 	for k, v := range metadata {
 		if strings.HasPrefix(k, "X-Amz-Meta-X-Minio-Internal-") {
 			newMeta[strings.TrimPrefix(k, "X-Amz-Meta-")] = v
@@ -882,6 +879,16 @@ func CleanMinioInternalMetadataKeys(metadata map[string]string) map[string]strin
 		}
 	}
 	return newMeta
+}
+
+// compressOpts are the options for writing compressed data.
+var compressOpts []s2.WriterOption
+
+func init() {
+	if runtime.GOARCH == "amd64" {
+		// On amd64 we have assembly and can use stronger compression.
+		compressOpts = append(compressOpts, s2.WriterBetterCompression())
+	}
 }
 
 // newS2CompressReader will read data from r, compress it and return the compressed data as a Reader.
@@ -894,7 +901,7 @@ func newS2CompressReader(r io.Reader, on int64) io.ReadCloser {
 	pr, pw := io.Pipe()
 	// Copy input to compressor
 	go func() {
-		comp := s2.NewWriter(pw)
+		comp := s2.NewWriter(pw, compressOpts...)
 		cn, err := io.Copy(comp, r)
 		if err != nil {
 			comp.Close()
@@ -947,7 +954,6 @@ func compressSelfTest() {
 	failOnErr(err)
 	if !bytes.Equal(got, data[skip:]) {
 		logger.Fatal(errSelfTestFailure, "compress: self-test roundtrip mismatch.")
-
 	}
 }
 

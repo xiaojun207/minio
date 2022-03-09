@@ -209,8 +209,17 @@ func NewMQTTTarget(id string, args MQTTArgs, doneCh <-chan struct{}, loggerOnce 
 		args.MaxReconnectInterval = 10 * time.Minute
 	}
 
+	if args.KeepAlive == 0 {
+		args.KeepAlive = 10 * time.Second
+	}
+
+	// Using hex here, to make sure we avoid 23
+	// character limit on client_id according to
+	// MQTT spec.
+	clientID := fmt.Sprintf("%x", time.Now().UnixNano())
+
 	options := mqtt.NewClientOptions().
-		SetClientID("").
+		SetClientID(clientID).
 		SetCleanSession(true).
 		SetUsername(args.User).
 		SetPassword(args.Password).
@@ -272,10 +281,8 @@ func NewMQTTTarget(id string, args MQTTArgs, doneCh <-chan struct{}, loggerOnce 
 			// Start replaying events from the store.
 			go sendEvents(target, eventKeyCh, doneCh, target.loggerOnce)
 		}
-	} else {
-		if token.Wait() && token.Error() != nil {
-			return target, token.Error()
-		}
+	} else if token.Wait() && token.Error() != nil {
+		return target, token.Error()
 	}
 	return target, nil
 }

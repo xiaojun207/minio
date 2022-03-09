@@ -55,6 +55,7 @@ func TestParseMode(t *testing.T) {
 		}
 	}
 }
+
 func TestParseLegalHoldStatus(t *testing.T) {
 	tests := []struct {
 		value          string
@@ -137,6 +138,7 @@ func TestUnmarshalDefaultRetention(t *testing.T) {
 		}
 		var dr DefaultRetention
 		err = xml.Unmarshal(d, &dr)
+		//nolint:gocritic
 		if tt.expectedErr == nil {
 			if err != nil {
 				t.Fatalf("error: expected = <nil>, got = %v", err)
@@ -173,6 +175,7 @@ func TestParseObjectLockConfig(t *testing.T) {
 	}
 	for _, tt := range tests {
 		_, err := ParseObjectLockConfig(strings.NewReader(tt.value))
+		//nolint:gocritic
 		if tt.expectedErr == nil {
 			if err != nil {
 				t.Fatalf("error: expected = <nil>, got = %v", err)
@@ -209,6 +212,7 @@ func TestParseObjectRetention(t *testing.T) {
 	}
 	for _, tt := range tests {
 		_, err := ParseObjectRetention(strings.NewReader(tt.value))
+		//nolint:gocritic
 		if tt.expectedErr == nil {
 			if err != nil {
 				t.Fatalf("error: expected = <nil>, got = %v", err)
@@ -367,6 +371,7 @@ func TestParseObjectLockRetentionHeaders(t *testing.T) {
 
 	for i, tt := range tests {
 		_, _, err := ParseObjectLockRetentionHeaders(tt.header)
+		//nolint:gocritic
 		if tt.expectedErr == nil {
 			if err != nil {
 				t.Fatalf("Case %d error: expected = <nil>, got = %v", i, err)
@@ -494,6 +499,7 @@ func TestParseObjectLegalHold(t *testing.T) {
 	}
 	for i, tt := range tests {
 		_, err := ParseObjectLegalHold(strings.NewReader(tt.value))
+		//nolint:gocritic
 		if tt.expectedErr == nil {
 			if err != nil {
 				t.Fatalf("Case %d error: expected = <nil>, got = %v", i, err)
@@ -505,6 +511,7 @@ func TestParseObjectLegalHold(t *testing.T) {
 		}
 	}
 }
+
 func TestFilterObjectLockMetadata(t *testing.T) {
 	tests := []struct {
 		metadata        map[string]string
@@ -571,9 +578,11 @@ func TestFilterObjectLockMetadata(t *testing.T) {
 				"x-amz-object-lock-mode":              "governance",
 				"x-amz-object-lock-retain-until-date": "2020-02-01",
 			},
-			expected: map[string]string{"x-amz-object-lock-legal-hold": "on",
+			expected: map[string]string{
+				"x-amz-object-lock-legal-hold":        "on",
 				"x-amz-object-lock-mode":              "governance",
-				"x-amz-object-lock-retain-until-date": "2020-02-01"},
+				"x-amz-object-lock-retain-until-date": "2020-02-01",
+			},
 		},
 	}
 

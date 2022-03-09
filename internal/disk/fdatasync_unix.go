@@ -1,3 +1,4 @@
+//go:build freebsd || netbsd || openbsd || darwin
 // +build freebsd netbsd openbsd darwin
 
 // Copyright (c) 2015-2021 MinIO, Inc.
@@ -27,4 +28,9 @@ import (
 // Fdatasync is fsync on freebsd/darwin
 func Fdatasync(f *os.File) error {
 	return syscall.Fsync(int(f.Fd()))
+}
+
+// FadviseDontNeed is a no-op
+func FadviseDontNeed(f *os.File) error {
+	return nil
 }

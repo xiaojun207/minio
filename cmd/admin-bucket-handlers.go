@@ -65,12 +65,33 @@ func (a adminAPIHandlers) PutBucketQuotaConfigHandler(w http.ResponseWriter, r *
 		return
 	}
 
-	if _, err = parseBucketQuota(bucket, data); err != nil {
+	quotaConfig, err := parseBucketQuota(bucket, data)
+	if err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
 	}
 
-	if err = globalBucketMetadataSys.Update(bucket, bucketQuotaConfigFile, data); err != nil {
+	if quotaConfig.Type == "fifo" {
+		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrInvalidRequest), r.URL)
+		return
+	}
+
+	if err = globalBucketMetadataSys.Update(ctx, bucket, bucketQuotaConfigFile, data); err != nil {
+		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
+		return
+	}
+
+	bucketMeta := madmin.SRBucketMeta{
+		Type:   madmin.SRBucketMetaTypeQuotaConfig,
+		Bucket: bucket,
+		Quota:  data,
+	}
+	if quotaConfig.Quota == 0 {
+		bucketMeta.Quota = nil
+	}
+
+	// Call site replication hook.
+	if err = globalSiteReplicationSys.BucketMetaHook(ctx, bucketMeta); err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
 	}
@@ -99,7 +120,7 @@ func (a adminAPIHandlers) GetBucketQuotaConfigHandler(w http.ResponseWriter, r *
 		return
 	}
 
-	config, err := globalBucketMetadataSys.GetQuotaConfig(bucket)
+	config, err := globalBucketMetadataSys.GetQuotaConfig(ctx, bucket)
 	if err != nil {
 		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
 		return
@@ -155,7 +176,7 @@ func (a adminAPIHandlers) SetRemoteTargetHandler(w http.ResponseWriter, r *http.
 		return
 	}
 	var target madmin.BucketTarget
-	var json = jsoniter.ConfigCompatibleWithStandardLibrary
+	json := jsoniter.ConfigCompatibleWithStandardLibrary
 	if err = json.Unmarshal(reqBytes, &target); err != nil {
 		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErrWithErr(ErrAdminConfigBadJSON, err), r.URL)
 		return
@@ -230,7 +251,7 @@ func (a adminAPIHandlers) SetRemoteTargetHandler(w http.ResponseWriter, r *http.
 		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErrWithErr(ErrAdminConfigBadJSON, err), r.URL)
 		return
 	}
-	if err = globalBucketMetadataSys.Update(bucket, bucketTargetsFile, tgtBytes); err != nil {
+	if err = globalBucketMetadataSys.Update(ctx, bucket, bucketTargetsFile, tgtBytes); err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
 	}
@@ -324,7 +345,7 @@ func (a adminAPIHandlers) RemoveRemoteTargetHandler(w http.ResponseWriter, r *ht
 		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErrWithErr(ErrAdminConfigBadJSON, err), r.URL)
 		return
 	}
-	if err = globalBucketMetadataSys.Update(bucket, bucketTargetsFile, tgtBytes); err != nil {
+	if err = globalBucketMetadataSys.Update(ctx, bucket, bucketTargetsFile, tgtBytes); err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
 	}

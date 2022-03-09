@@ -63,6 +63,15 @@ func (api objectAPIHandlers) PutBucketVersioningHandler(w http.ResponseWriter, r
 		return
 	}
 
+	if globalSiteReplicationSys.isEnabled() {
+		writeErrorResponse(ctx, w, APIError{
+			Code:           "InvalidBucketState",
+			Description:    "Cluster replication is enabled for this site, so the versioning state cannot be changed.",
+			HTTPStatusCode: http.StatusConflict,
+		}, r.URL)
+		return
+	}
+
 	if rcfg, _ := globalBucketObjectLockSys.Get(bucket); rcfg.LockEnabled && v.Suspended() {
 		writeErrorResponse(ctx, w, APIError{
 			Code:           "InvalidBucketState",
@@ -86,7 +95,7 @@ func (api objectAPIHandlers) PutBucketVersioningHandler(w http.ResponseWriter, r
 		return
 	}
 
-	if err = globalBucketMetadataSys.Update(bucket, bucketVersioningConfig, configData); err != nil {
+	if err = globalBucketMetadataSys.Update(ctx, bucket, bucketVersioningConfig, configData); err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
 	}
@@ -135,5 +144,4 @@ func (api objectAPIHandlers) GetBucketVersioningHandler(w http.ResponseWriter, r
 
 	// Write bucket versioning configuration to client
 	writeSuccessResponseXML(w, configData)
-
 }

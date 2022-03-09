@@ -25,6 +25,13 @@ import (
 var (
 	Help = config.HelpKVS{
 		config.HelpKV{
+			Key:         config.Enable,
+			Description: "set to 'on' to enable the logger webhook",
+			Optional:    true,
+			Type:        "on|off",
+			Sensitive:   false,
+		},
+		config.HelpKV{
 			Key:         Endpoint,
 			Description: `HTTP(s) endpoint e.g. "http://localhost:8080/minio/logs/server"`,
 			Type:        "url",
@@ -36,6 +43,26 @@ var (
 			Optional:    true,
 			Type:        "string",
 			Sensitive:   true,
+		},
+		config.HelpKV{
+			Key:         ClientCert,
+			Description: "mTLS certificate for Logger Webhook authentication",
+			Optional:    true,
+			Type:        "string",
+			Sensitive:   true,
+		},
+		config.HelpKV{
+			Key:         ClientKey,
+			Description: "mTLS certificate key for Logger Webhook authentication",
+			Optional:    true,
+			Type:        "string",
+			Sensitive:   true,
+		},
+		config.HelpKV{
+			Key:         QueueSize,
+			Description: "configure channel queue size for Logger Webhook targets",
+			Optional:    true,
+			Type:        "number",
 		},
 		config.HelpKV{
 			Key:         config.Comment,
@@ -72,6 +99,12 @@ var (
 			Optional:    true,
 			Type:        "string",
 			Sensitive:   true,
+		},
+		config.HelpKV{
+			Key:         QueueSize,
+			Description: "configure channel queue size for Audit Webhook targets",
+			Optional:    true,
+			Type:        "number",
 		},
 		config.HelpKV{
 			Key:         config.Comment,

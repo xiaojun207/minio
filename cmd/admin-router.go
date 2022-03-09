@@ -38,12 +38,9 @@ type adminAPIHandlers struct{}
 
 // registerAdminRouter - Add handler functions for each service REST API routes.
 func registerAdminRouter(router *mux.Router, enableConfigOps bool) {
-
 	adminAPI := adminAPIHandlers{}
 	// Admin router
 	adminRouter := router.PathPrefix(adminPathPrefix).Subrouter()
-
-	/// Service operations
 
 	adminVersions := []string{
 		adminAPIVersionPrefix,
@@ -71,17 +68,20 @@ func registerAdminRouter(router *mux.Router, enableConfigOps bool) {
 		adminRouter.Methods(http.MethodGet).Path(adminVersion + "/datausageinfo").HandlerFunc(gz(httpTraceAll(adminAPI.DataUsageInfoHandler)))
 
 		if globalIsDistErasure || globalIsErasure {
-			/// Heal operations
+			// Heal operations
 
 			// Heal processing endpoint.
 			adminRouter.Methods(http.MethodPost).Path(adminVersion + "/heal/").HandlerFunc(gz(httpTraceAll(adminAPI.HealHandler)))
 			adminRouter.Methods(http.MethodPost).Path(adminVersion + "/heal/{bucket}").HandlerFunc(gz(httpTraceAll(adminAPI.HealHandler)))
 			adminRouter.Methods(http.MethodPost).Path(adminVersion + "/heal/{bucket}/{prefix:.*}").HandlerFunc(gz(httpTraceAll(adminAPI.HealHandler)))
-
 			adminRouter.Methods(http.MethodPost).Path(adminVersion + "/background-heal/status").HandlerFunc(gz(httpTraceAll(adminAPI.BackgroundHealStatusHandler)))
 
-			/// Health operations
+			// Pool operations
+			adminRouter.Methods(http.MethodGet).Path(adminVersion + "/pools/list").HandlerFunc(gz(httpTraceAll(adminAPI.ListPools)))
+			adminRouter.Methods(http.MethodGet).Path(adminVersion+"/pools/status").HandlerFunc(gz(httpTraceAll(adminAPI.StatusPool))).Queries("pool", "{pool:.*}")
 
+			adminRouter.Methods(http.MethodPost).Path(adminVersion+"/pools/decommission").HandlerFunc(gz(httpTraceAll(adminAPI.StartDecommission))).Queries("pool", "{pool:.*}")
+			adminRouter.Methods(http.MethodPost).Path(adminVersion+"/pools/cancel").HandlerFunc(gz(httpTraceAll(adminAPI.CancelDecommission))).Queries("pool", "{pool:.*}")
 		}
 
 		// Profiling operations
@@ -106,7 +106,7 @@ func registerAdminRouter(router *mux.Router, enableConfigOps bool) {
 			adminRouter.Methods(http.MethodPut).Path(adminVersion+"/restore-config-history-kv").HandlerFunc(gz(httpTraceHdrs(adminAPI.RestoreConfigHistoryKVHandler))).Queries("restoreId", "{restoreId:.*}")
 		}
 
-		/// Config import/export bulk operations
+		// Config import/export bulk operations
 		if enableConfigOps {
 			// Get config
 			adminRouter.Methods(http.MethodGet).Path(adminVersion + "/config").HandlerFunc(gz(httpTraceHdrs(adminAPI.GetConfigHandler)))
@@ -191,6 +191,26 @@ func registerAdminRouter(router *mux.Router, enableConfigOps bool) {
 			adminRouter.Methods(http.MethodPut).Path(adminVersion + "/tier").HandlerFunc(gz(httpTraceHdrs(adminAPI.AddTierHandler)))
 			adminRouter.Methods(http.MethodPost).Path(adminVersion + "/tier/{tier}").HandlerFunc(gz(httpTraceHdrs(adminAPI.EditTierHandler)))
 			adminRouter.Methods(http.MethodGet).Path(adminVersion + "/tier").HandlerFunc(gz(httpTraceHdrs(adminAPI.ListTierHandler)))
+			adminRouter.Methods(http.MethodDelete).Path(adminVersion + "/tier/{tier}").HandlerFunc(gz(httpTraceHdrs(adminAPI.RemoveTierHandler)))
+			adminRouter.Methods(http.MethodGet).Path(adminVersion + "/tier/{tier}").HandlerFunc(gz(httpTraceHdrs(adminAPI.VerifyTierHandler)))
+			// Tier stats
+			adminRouter.Methods(http.MethodGet).Path(adminVersion + "/tier-stats").HandlerFunc(gz(httpTraceHdrs(adminAPI.TierStatsHandler)))
+
+			// Cluster Replication APIs
+			adminRouter.Methods(http.MethodPut).Path(adminVersion + "/site-replication/add").HandlerFunc(gz(httpTraceHdrs(adminAPI.SiteReplicationAdd)))
+			adminRouter.Methods(http.MethodPut).Path(adminVersion + "/site-replication/remove").HandlerFunc(gz(httpTraceHdrs(adminAPI.SiteReplicationRemove)))
+			adminRouter.Methods(http.MethodGet).Path(adminVersion + "/site-replication/info").HandlerFunc(gz(httpTraceHdrs(adminAPI.SiteReplicationInfo)))
+			adminRouter.Methods(http.MethodGet).Path(adminVersion + "/site-replication/metainfo").HandlerFunc(gz(httpTraceHdrs(adminAPI.SiteReplicationMetaInfo)))
+			adminRouter.Methods(http.MethodGet).Path(adminVersion + "/site-replication/status").HandlerFunc(gz(httpTraceHdrs(adminAPI.SiteReplicationStatus)))
+
+			adminRouter.Methods(http.MethodPut).Path(adminVersion + "/site-replication/peer/join").HandlerFunc(gz(httpTraceHdrs(adminAPI.SRPeerJoin)))
+			adminRouter.Methods(http.MethodPut).Path(adminVersion+"/site-replication/peer/bucket-ops").HandlerFunc(gz(httpTraceHdrs(adminAPI.SRPeerBucketOps))).Queries("bucket", "{bucket:.*}").Queries("operation", "{operation:.*}")
+			adminRouter.Methods(http.MethodPut).Path(adminVersion + "/site-replication/peer/iam-item").HandlerFunc(gz(httpTraceHdrs(adminAPI.SRPeerReplicateIAMItem)))
+			adminRouter.Methods(http.MethodPut).Path(adminVersion + "/site-replication/peer/bucket-meta").HandlerFunc(gz(httpTraceHdrs(adminAPI.SRPeerReplicateBucketItem)))
+			adminRouter.Methods(http.MethodGet).Path(adminVersion + "/site-replication/peer/idp-settings").HandlerFunc(gz(httpTraceHdrs(adminAPI.SRPeerGetIDPSettings)))
+			adminRouter.Methods(http.MethodPut).Path(adminVersion + "/site-replication/edit").HandlerFunc(gz(httpTraceHdrs(adminAPI.SiteReplicationEdit)))
+			adminRouter.Methods(http.MethodPut).Path(adminVersion + "/site-replication/peer/edit").HandlerFunc(gz(httpTraceHdrs(adminAPI.SRPeerEdit)))
+			adminRouter.Methods(http.MethodPut).Path(adminVersion + "/site-replication/peer/remove").HandlerFunc(gz(httpTraceHdrs(adminAPI.SRPeerRemove)))
 		}
 
 		if globalIsDistErasure {
@@ -202,6 +222,9 @@ func registerAdminRouter(router *mux.Router, enableConfigOps bool) {
 		}
 
 		adminRouter.Methods(http.MethodPost).Path(adminVersion + "/speedtest").HandlerFunc(httpTraceHdrs(adminAPI.SpeedtestHandler))
+		adminRouter.Methods(http.MethodPost).Path(adminVersion + "/speedtest/object").HandlerFunc(httpTraceHdrs(adminAPI.ObjectSpeedtestHandler))
+		adminRouter.Methods(http.MethodPost).Path(adminVersion + "/speedtest/drive").HandlerFunc(httpTraceHdrs(adminAPI.DriveSpeedtestHandler))
+		adminRouter.Methods(http.MethodPost).Path(adminVersion + "/speedtest/net").HandlerFunc(httpTraceHdrs(adminAPI.NetperfHandler))
 
 		// HTTP Trace
 		adminRouter.Methods(http.MethodGet).Path(adminVersion + "/trace").HandlerFunc(gz(http.HandlerFunc(adminAPI.TraceHandler)))

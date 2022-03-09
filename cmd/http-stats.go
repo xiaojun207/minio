@@ -128,7 +128,7 @@ func (stats *HTTPAPIStats) Dec(api string) {
 func (stats *HTTPAPIStats) Load() map[string]int {
 	stats.Lock()
 	defer stats.Unlock()
-	var apiStats = make(map[string]int, len(stats.apiStats))
+	apiStats := make(map[string]int, len(stats.apiStats))
 	for k, v := range stats.apiStats {
 		apiStats[k] = v
 	}
@@ -138,11 +138,13 @@ func (stats *HTTPAPIStats) Load() map[string]int {
 // HTTPStats holds statistics information about
 // HTTP requests made by all clients
 type HTTPStats struct {
+	s3RequestsInQueue       int32 // ref: https://golang.org/pkg/sync/atomic/#pkg-note-BUG
+	_                       int32 // For 64 bits alignment
+	s3RequestsIncoming      uint64
 	rejectedRequestsAuth    uint64
 	rejectedRequestsTime    uint64
 	rejectedRequestsHeader  uint64
 	rejectedRequestsInvalid uint64
-	s3RequestsInQueue       int32
 	currentS3Requests       HTTPAPIStats
 	totalS3Requests         HTTPAPIStats
 	totalS3Errors           HTTPAPIStats
@@ -153,9 +155,15 @@ func (st *HTTPStats) addRequestsInQueue(i int32) {
 	atomic.AddInt32(&st.s3RequestsInQueue, i)
 }
 
+func (st *HTTPStats) incS3RequestsIncoming() {
+	// Golang automatically resets to zero if this overflows
+	atomic.AddUint64(&st.s3RequestsIncoming, 1)
+}
+
 // Converts http stats into struct to be sent back to the client.
 func (st *HTTPStats) toServerHTTPStats() ServerHTTPStats {
 	serverStats := ServerHTTPStats{}
+	serverStats.S3RequestsIncoming = atomic.SwapUint64(&st.s3RequestsIncoming, 0)
 	serverStats.S3RequestsInQueue = atomic.LoadInt32(&st.s3RequestsInQueue)
 	serverStats.TotalS3RejectedAuth = atomic.LoadUint64(&st.rejectedRequestsAuth)
 	serverStats.TotalS3RejectedTime = atomic.LoadUint64(&st.rejectedRequestsTime)
@@ -178,8 +186,8 @@ func (st *HTTPStats) toServerHTTPStats() ServerHTTPStats {
 
 // Update statistics from http request and response data
 func (st *HTTPStats) updateStats(api string, r *http.Request, w *logger.ResponseWriter) {
-	// A successful request has a 2xx response code
-	successReq := w.StatusCode >= 200 && w.StatusCode < 300
+	// A successful request has a 2xx response code or < 4xx response
+	successReq := w.StatusCode >= 200 && w.StatusCode < 400
 
 	if !strings.HasSuffix(r.URL.Path, prometheusMetricsPathLegacy) ||
 		!strings.HasSuffix(r.URL.Path, prometheusMetricsV2ClusterPath) ||
@@ -189,7 +197,7 @@ func (st *HTTPStats) updateStats(api string, r *http.Request, w *logger.Response
 			switch w.StatusCode {
 			case 0:
 			case 499:
-				// 499 is a good error, shall be counted at canceled.
+				// 499 is a good error, shall be counted as canceled.
 				st.totalS3Canceled.Inc(api)
 			default:
 				st.totalS3Errors.Inc(api)

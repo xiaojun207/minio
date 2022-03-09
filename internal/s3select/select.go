@@ -31,12 +31,16 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/klauspost/compress/s2"
+	"github.com/klauspost/compress/zstd"
+	gzip "github.com/klauspost/pgzip"
 	"github.com/minio/minio/internal/s3select/csv"
 	"github.com/minio/minio/internal/s3select/json"
 	"github.com/minio/minio/internal/s3select/parquet"
 	"github.com/minio/minio/internal/s3select/simdj"
 	"github.com/minio/minio/internal/s3select/sql"
 	"github.com/minio/simdjson-go"
+	"github.com/pierrec/lz4"
 )
 
 type recordReader interface {
@@ -57,8 +61,13 @@ type CompressionType string
 
 const (
 	noneType  CompressionType = "none"
-	gzipType  CompressionType = "gzip"
-	bzip2Type CompressionType = "bzip2"
+	gzipType  CompressionType = "GZIP"
+	bzip2Type CompressionType = "BZIP2"
+
+	zstdType   CompressionType = "ZSTD"
+	lz4Type    CompressionType = "LZ4"
+	s2Type     CompressionType = "S2"
+	snappyType CompressionType = "SNAPPY"
 )
 
 const (
@@ -87,13 +96,13 @@ func (c *CompressionType) UnmarshalXML(d *xml.Decoder, start xml.StartElement) e
 		return errMalformedXML(err)
 	}
 
-	parsedType := CompressionType(strings.ToLower(s))
-	if s == "" {
+	parsedType := CompressionType(strings.ToUpper(s))
+	if s == "" || parsedType == "NONE" {
 		parsedType = noneType
 	}
 
 	switch parsedType {
-	case noneType, gzipType, bzip2Type:
+	case noneType, gzipType, bzip2Type, snappyType, s2Type, zstdType, lz4Type:
 	default:
 		return errInvalidCompressionFormat(fmt.Errorf("invalid compression format '%v'", s))
 	}
@@ -127,7 +136,7 @@ func (input *InputSerialization) UnmarshalXML(d *xml.Decoder, start xml.StartEle
 	}
 
 	// If no compression is specified, set to noneType
-	if parsedInput.CompressionType == CompressionType("") {
+	if parsedInput.CompressionType == "" {
 		parsedInput.CompressionType = noneType
 	}
 
@@ -220,9 +229,7 @@ type S3Select struct {
 	close          func() error
 }
 
-var (
-	legacyXMLName = "SelectObjectContentRequest"
-)
+var legacyXMLName = "SelectObjectContentRequest"
 
 // UnmarshalXML - decodes XML data.
 func (s3Select *S3Select) UnmarshalXML(d *xml.Decoder, start xml.StartElement) error {
@@ -309,7 +316,19 @@ func (s3Select *S3Select) Open(getReader func(offset, length int64) (io.ReadClos
 			rc.Close()
 			var stErr bzip2.StructuralError
 			if errors.As(err, &stErr) {
-				return errInvalidBZIP2CompressionFormat(err)
+				return errInvalidCompression(err, s3Select.Input.CompressionType)
+			}
+			// Test these compressor errors
+			errs := []error{
+				gzip.ErrHeader, gzip.ErrChecksum,
+				s2.ErrCorrupt, s2.ErrUnsupported, s2.ErrCRC,
+				zstd.ErrBlockTooSmall, zstd.ErrMagicMismatch, zstd.ErrWindowSizeExceeded, zstd.ErrUnknownDictionary, zstd.ErrWindowSizeTooSmall,
+				lz4.ErrInvalid, lz4.ErrBlockDependency,
+			}
+			for _, e := range errs {
+				if errors.Is(err, e) {
+					return errInvalidCompression(err, s3Select.Input.CompressionType)
+				}
 			}
 			return err
 		}
@@ -348,7 +367,7 @@ func (s3Select *S3Select) Open(getReader func(offset, length int64) (io.ReadClos
 		return err
 	}
 
-	panic(fmt.Errorf("unknown input format '%v'", s3Select.Input.format))
+	return fmt.Errorf("unknown input format '%v'", s3Select.Input.format)
 }
 
 func (s3Select *S3Select) marshal(buf *bytes.Buffer, record sql.Record) error {
@@ -366,7 +385,7 @@ func (s3Select *S3Select) marshal(buf *bytes.Buffer, record sql.Record) error {
 			FieldDelimiter: []rune(s3Select.Output.CSVArgs.FieldDelimiter)[0],
 			Quote:          []rune(s3Select.Output.CSVArgs.QuoteCharacter)[0],
 			QuoteEscape:    []rune(s3Select.Output.CSVArgs.QuoteEscapeCharacter)[0],
-			AlwaysQuote:    strings.ToLower(s3Select.Output.CSVArgs.QuoteFields) == "always",
+			AlwaysQuote:    strings.EqualFold(s3Select.Output.CSVArgs.QuoteFields, "always"),
 		}
 		err := record.WriteCSV(bufioWriter, opts)
 		if err != nil {
@@ -527,6 +546,17 @@ OuterLoop:
 				}
 
 				outputQueue[len(outputQueue)-1] = outputRecord
+				if s3Select.statement.LimitReached() {
+					if !sendRecord() {
+						break
+					}
+					if err = writer.Finish(s3Select.getProgress()); err != nil {
+						// FIXME: log this error.
+						err = nil
+					}
+					return
+				}
+
 				if len(outputQueue) < cap(outputQueue) {
 					continue
 				}
@@ -545,6 +575,9 @@ OuterLoop:
 
 // Close - closes opened S3 object.
 func (s3Select *S3Select) Close() error {
+	if s3Select.recordReader == nil {
+		return nil
+	}
 	return s3Select.recordReader.Close()
 }
 

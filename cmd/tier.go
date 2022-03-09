@@ -40,12 +40,15 @@ var (
 	errTierInsufficientCreds = errors.New("insufficient tier credentials supplied")
 	errTierBackendInUse      = errors.New("remote tier backend already in use")
 	errTierTypeUnsupported   = errors.New("unsupported tier type")
+	errTierBackendNotEmpty   = errors.New("remote tier not empty")
 )
 
 const (
 	tierConfigFile    = "tier-config.bin"
 	tierConfigFormat  = 1
 	tierConfigVersion = 1
+
+	minioHotTier = "STANDARD"
 )
 
 // tierConfigPath refers to remote tier config object name
@@ -85,7 +88,6 @@ func (config *TierConfigMgr) Add(ctx context.Context, tier madmin.TierConfig) er
 	defer config.Unlock()
 
 	// check if tier name is in all caps
-
 	tierName := tier.Name
 	if tierName != strings.ToUpper(tierName) {
 		return errTierNameNotUppercase
@@ -115,6 +117,40 @@ func (config *TierConfigMgr) Add(ctx context.Context, tier madmin.TierConfig) er
 	return nil
 }
 
+// Remove removes tier if it is empty.
+func (config *TierConfigMgr) Remove(ctx context.Context, tier string) error {
+	d, err := config.getDriver(tier)
+	if err != nil {
+		return err
+	}
+	if inuse, err := d.InUse(ctx); err != nil {
+		return err
+	} else if inuse {
+		return errTierBackendNotEmpty
+	} else {
+		config.Lock()
+		delete(config.Tiers, tier)
+		delete(config.drivercache, tier)
+		config.Unlock()
+	}
+	return nil
+}
+
+// Verify verifies if tier's config is valid by performing all supported
+// operations on the corresponding warmbackend.
+func (config *TierConfigMgr) Verify(ctx context.Context, tier string) error {
+	d, err := config.getDriver(tier)
+	if err != nil {
+		return err
+	}
+	return checkWarmBackend(ctx, d)
+}
+
+// Empty returns if tier targets are empty
+func (config *TierConfigMgr) Empty() bool {
+	return len(config.ListTiers()) == 0
+}
+
 // ListTiers lists remote tiers configured in this deployment.
 func (config *TierConfigMgr) ListTiers() []madmin.TierConfig {
 	config.RLock()
@@ -141,7 +177,7 @@ func (config *TierConfigMgr) Edit(ctx context.Context, tierName string, creds ma
 		return errTierNotFound
 	}
 
-	newCfg := config.Tiers[tierName]
+	cfg := config.Tiers[tierName]
 	switch tierType {
 	case madmin.S3:
 		if (creds.AccessKey == "" || creds.SecretKey == "") && !creds.AWSRole {
@@ -149,30 +185,29 @@ func (config *TierConfigMgr) Edit(ctx context.Context, tierName string, creds ma
 		}
 		switch {
 		case creds.AWSRole:
-			newCfg.S3.AWSRole = true
+			cfg.S3.AWSRole = true
 		default:
-			newCfg.S3.AccessKey = creds.AccessKey
-			newCfg.S3.SecretKey = creds.SecretKey
+			cfg.S3.AccessKey = creds.AccessKey
+			cfg.S3.SecretKey = creds.SecretKey
 		}
 	case madmin.Azure:
-		if creds.AccessKey == "" || creds.SecretKey == "" {
+		if creds.SecretKey == "" {
 			return errTierInsufficientCreds
 		}
-		newCfg.Azure.AccountName = creds.AccessKey
-		newCfg.Azure.AccountKey = creds.SecretKey
+		cfg.Azure.AccountKey = creds.SecretKey
 
 	case madmin.GCS:
 		if creds.CredsJSON == nil {
 			return errTierInsufficientCreds
 		}
-		newCfg.GCS.Creds = base64.URLEncoding.EncodeToString(creds.CredsJSON)
+		cfg.GCS.Creds = base64.URLEncoding.EncodeToString(creds.CredsJSON)
 	}
 
-	d, err := newWarmBackend(ctx, newCfg)
+	d, err := newWarmBackend(ctx, cfg)
 	if err != nil {
 		return err
 	}
-	config.Tiers[tierName] = newCfg
+	config.Tiers[tierName] = cfg
 	config.drivercache[tierName] = d
 	return nil
 }
@@ -354,7 +389,6 @@ func loadTierConfig(ctx context.Context, objAPI ObjectLayer) (*TierConfigMgr, er
 		return nil, decErr
 	}
 	return cfg, nil
-
 }
 
 // Reset clears remote tier configured and clears tier driver cache.
@@ -367,7 +401,6 @@ func (config *TierConfigMgr) Reset() {
 		delete(config.Tiers, k)
 	}
 	config.Unlock()
-
 }
 
 // Init initializes tier configuration reading from objAPI

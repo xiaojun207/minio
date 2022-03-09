@@ -25,6 +25,7 @@ import (
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/minio/internal/logger/message/log"
 	"github.com/minio/minio/internal/logger/target/console"
+	"github.com/minio/minio/internal/logger/target/types"
 	"github.com/minio/minio/internal/pubsub"
 	xnet "github.com/minio/pkg/net"
 )
@@ -32,7 +33,7 @@ import (
 // number of log messages to buffer
 const defaultLogBufferCount = 10000
 
-//HTTPConsoleLoggerSys holds global console logger state
+// HTTPConsoleLoggerSys holds global console logger state
 type HTTPConsoleLoggerSys struct {
 	sync.RWMutex
 	pubsub   *pubsub.PubSub
@@ -77,7 +78,7 @@ func (sys *HTTPConsoleLoggerSys) HasLogListeners() bool {
 func (sys *HTTPConsoleLoggerSys) Subscribe(subCh chan interface{}, doneCh <-chan struct{}, node string, last int, logKind string, filter func(entry interface{}) bool) {
 	// Enable console logging for remote client.
 	if !sys.HasLogListeners() {
-		logger.AddTarget(sys)
+		logger.AddSystemTarget(sys)
 	}
 
 	cnt := 0
@@ -129,7 +130,7 @@ func (sys *HTTPConsoleLoggerSys) Endpoint() string {
 
 // String - stringer function for interface compatibility
 func (sys *HTTPConsoleLoggerSys) String() string {
-	return "console+http"
+	return logger.ConsoleLoggerTgt
 }
 
 // Content returns the console stdout log
@@ -148,6 +149,15 @@ func (sys *HTTPConsoleLoggerSys) Content() (logs []log.Entry) {
 	sys.RUnlock()
 
 	return
+}
+
+// Cancel - cancels the target
+func (sys *HTTPConsoleLoggerSys) Cancel() {
+}
+
+// Type - returns type of the target
+func (sys *HTTPConsoleLoggerSys) Type() types.TargetType {
+	return types.TargetConsole
 }
 
 // Send log message 'e' to console and publish to console

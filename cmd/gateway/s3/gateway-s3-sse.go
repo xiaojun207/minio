@@ -75,12 +75,10 @@ func (l *s3EncObjects) ListObjects(ctx context.Context, bucket string, prefix st
 	loi.Objects = res.Objects
 	loi.Prefixes = res.Prefixes
 	return loi, nil
-
 }
 
 // ListObjectsV2 lists all blobs in S3 bucket filtered by prefix
 func (l *s3EncObjects) ListObjectsV2(ctx context.Context, bucket, prefix, continuationToken, delimiter string, maxKeys int, fetchOwner bool, startAfter string) (loi minio.ListObjectsV2Info, e error) {
-
 	var objects []minio.ObjectInfo
 	var prefixes []string
 	var isTruncated bool
@@ -113,7 +111,7 @@ func (l *s3EncObjects) ListObjectsV2(ctx context.Context, bucket, prefix, contin
 			} else {
 				objects = append(objects, obj)
 			}
-			if len(objects) > maxKeys {
+			if maxKeys > 0 && len(objects) > maxKeys {
 				break
 			}
 		}
@@ -130,7 +128,7 @@ func (l *s3EncObjects) ListObjectsV2(ctx context.Context, bucket, prefix, contin
 				prefixes = append(prefixes, p)
 			}
 		}
-		if (len(objects) > maxKeys) || !loi.IsTruncated {
+		if (maxKeys > 0 && len(objects) > maxKeys) || !loi.IsTruncated {
 			break
 		}
 	}
@@ -423,7 +421,6 @@ func (l *s3EncObjects) DeleteObjects(ctx context.Context, bucket string, objects
 
 // ListMultipartUploads lists all multipart uploads.
 func (l *s3EncObjects) ListMultipartUploads(ctx context.Context, bucket string, prefix string, keyMarker string, uploadIDMarker string, delimiter string, maxUploads int) (lmi minio.ListMultipartsInfo, e error) {
-
 	lmi, e = l.s3Objects.ListMultipartUploads(ctx, bucket, prefix, keyMarker, uploadIDMarker, delimiter, maxUploads)
 	if e != nil {
 		return
@@ -505,7 +502,6 @@ func (l *s3EncObjects) PutObject(ctx context.Context, bucket string, object stri
 
 // PutObjectPart puts a part of object in bucket
 func (l *s3EncObjects) PutObjectPart(ctx context.Context, bucket string, object string, uploadID string, partID int, data *minio.PutObjReader, opts minio.ObjectOptions) (pi minio.PartInfo, e error) {
-
 	if opts.ServerSideEncryption == nil {
 		return l.s3Objects.PutObjectPart(ctx, bucket, object, uploadID, partID, data, opts)
 	}
@@ -630,7 +626,6 @@ func (l *s3EncObjects) AbortMultipartUpload(ctx context.Context, bucket string, 
 
 // CompleteMultipartUpload completes ongoing multipart upload and finalizes object
 func (l *s3EncObjects) CompleteMultipartUpload(ctx context.Context, bucket, object, uploadID string, uploadedParts []minio.CompletePart, opts minio.ObjectOptions) (oi minio.ObjectInfo, e error) {
-
 	tmpMeta, err := l.getGWMetadata(ctx, bucket, getTmpDareMetaPath(object, uploadID))
 	if err != nil {
 		oi, e = l.s3Objects.CompleteMultipartUpload(ctx, bucket, object, uploadID, uploadedParts, opts)
@@ -668,7 +663,7 @@ func (l *s3EncObjects) CompleteMultipartUpload(ctx context.Context, bucket, obje
 		return oi, e
 	}
 
-	//delete any unencrypted version of object that might be on the backend
+	// delete any unencrypted version of object that might be on the backend
 	defer l.s3Objects.DeleteObject(ctx, bucket, object, opts)
 
 	// Save the final object size and modtime.
@@ -784,7 +779,7 @@ func (l *s3EncObjects) getStalePartsForBucket(ctx context.Context, bucket string
 	return
 }
 
-func (l *s3EncObjects) DeleteBucket(ctx context.Context, bucket string, forceDelete bool) error {
+func (l *s3EncObjects) DeleteBucket(ctx context.Context, bucket string, opts minio.DeleteBucketOptions) error {
 	var prefix, continuationToken, delimiter, startAfter string
 	expParts := make(map[string]string)
 

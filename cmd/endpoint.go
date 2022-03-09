@@ -18,8 +18,6 @@
 package cmd
 
 import (
-	"context"
-	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -36,7 +34,6 @@ import (
 	"github.com/dustin/go-humanize"
 	"github.com/minio/minio-go/v7/pkg/set"
 	"github.com/minio/minio/internal/config"
-	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/minio/internal/mountinfo"
 	"github.com/minio/pkg/env"
@@ -200,13 +197,27 @@ func NewEndpoint(arg string) (ep Endpoint, e error) {
 // PoolEndpoints represent endpoints in a given pool
 // along with its setCount and setDriveCount.
 type PoolEndpoints struct {
+	// indicates if endpoints are provided in non-ellipses style
+	Legacy       bool
 	SetCount     int
 	DrivesPerSet int
 	Endpoints    Endpoints
+	CmdLine      string
 }
 
 // EndpointServerPools - list of list of endpoints
 type EndpointServerPools []PoolEndpoints
+
+// GetPoolIdx return pool index
+func (l EndpointServerPools) GetPoolIdx(pool string) int {
+	for id, ep := range globalEndpoints {
+		if ep.CmdLine != pool {
+			continue
+		}
+		return id
+	}
+	return -1
+}
 
 // GetLocalPoolIdx returns the pool which endpoint belongs to locally.
 // if ep is remote this code will return -1 poolIndex
@@ -221,6 +232,13 @@ func (l EndpointServerPools) GetLocalPoolIdx(ep Endpoint) int {
 		}
 	}
 	return -1
+}
+
+// Legacy returns 'true' if the MinIO server commandline was
+// provided with no ellipses pattern, those are considered
+// legacy deployments.
+func (l EndpointServerPools) Legacy() bool {
+	return len(l) == 1 && l[0].Legacy
 }
 
 // Add add pool endpoints
@@ -500,6 +518,7 @@ func NewEndpoints(args ...string) (endpoints Endpoints, err error) {
 		}
 
 		// All endpoints have to be same type and scheme if applicable.
+		//nolint:gocritic
 		if i == 0 {
 			endpointType = endpoint.Type()
 			scheme = endpoint.Scheme
@@ -624,20 +643,33 @@ func CreateEndpoints(serverAddr string, foundLocal bool, args ...[]string) (Endp
 		}
 	}
 
-	// Check whether same path is not used in endpoints of a host on different port.
-	{
-		pathIPMap := make(map[string]set.StringSet)
-		for _, endpoint := range endpoints {
-			host := endpoint.Hostname()
-			hostIPSet, _ := getHostIP(host)
-			if IPSet, ok := pathIPMap[endpoint.Path]; ok {
-				if !IPSet.Intersection(hostIPSet).IsEmpty() {
-					return endpoints, setupType,
-						config.ErrInvalidErasureEndpoints(nil).Msg(fmt.Sprintf("path '%s' can not be served by different port on same address", endpoint.Path))
+	orchestrated := IsKubernetes() || IsDocker()
+	if !orchestrated {
+		// Check whether same path is not used in endpoints of a host on different port.
+		// Only verify this on baremetal setups, DNS is not available in orchestrated
+		// environments so we can't do much here.
+		{
+			pathIPMap := make(map[string]set.StringSet)
+			hostIPCache := make(map[string]set.StringSet)
+			for _, endpoint := range endpoints {
+				host := endpoint.Hostname()
+				hostIPSet, ok := hostIPCache[host]
+				if !ok {
+					hostIPSet, err = getHostIP(host)
+					if err != nil {
+						return endpoints, setupType, config.ErrInvalidErasureEndpoints(nil).Msg(fmt.Sprintf("host '%s' cannot resolve: %s", host, err))
+					}
+					hostIPCache[host] = hostIPSet
 				}
-				pathIPMap[endpoint.Path] = IPSet.Union(hostIPSet)
-			} else {
-				pathIPMap[endpoint.Path] = hostIPSet
+				if IPSet, ok := pathIPMap[endpoint.Path]; ok {
+					if !IPSet.Intersection(hostIPSet).IsEmpty() {
+						return endpoints, setupType,
+							config.ErrInvalidErasureEndpoints(nil).Msg(fmt.Sprintf("same path '%s' can not be served by different port on same address", endpoint.Path))
+					}
+					pathIPMap[endpoint.Path] = IPSet.Union(hostIPSet)
+				} else {
+					pathIPMap[endpoint.Path] = hostIPSet
+				}
 			}
 		}
 	}
@@ -739,72 +771,6 @@ func GetProxyEndpointLocalIndex(proxyEps []ProxyEndpoint) int {
 		if pep.IsLocal {
 			return i
 		}
-	}
-	return -1
-}
-
-func httpDo(clnt *http.Client, req *http.Request, f func(*http.Response, error) error) error {
-	ctx, cancel := context.WithTimeout(GlobalContext, 200*time.Millisecond)
-	defer cancel()
-
-	// Run the HTTP request in a goroutine and pass the response to f.
-	c := make(chan error, 1)
-	req = req.WithContext(ctx)
-	go func() { c <- f(clnt.Do(req)) }()
-	select {
-	case <-ctx.Done():
-		<-c // Wait for f to return.
-		return ctx.Err()
-	case err := <-c:
-		return err
-	}
-}
-
-func getOnlineProxyEndpointIdx() int {
-	type reqIndex struct {
-		Request *http.Request
-		Idx     int
-	}
-
-	proxyRequests := make(map[*http.Client]reqIndex, len(globalProxyEndpoints))
-	for i, proxyEp := range globalProxyEndpoints {
-		proxyEp := proxyEp
-		serverURL := &url.URL{
-			Scheme: proxyEp.Scheme,
-			Host:   proxyEp.Host,
-			Path:   pathJoin(healthCheckPathPrefix, healthCheckLivenessPath),
-		}
-
-		req, err := http.NewRequest(http.MethodGet, serverURL.String(), nil)
-		if err != nil {
-			continue
-		}
-
-		proxyRequests[&http.Client{
-			Transport: proxyEp.Transport,
-		}] = reqIndex{
-			Request: req,
-			Idx:     i,
-		}
-	}
-
-	for c, r := range proxyRequests {
-		if err := httpDo(c, r.Request, func(resp *http.Response, err error) error {
-			if err != nil {
-				return err
-			}
-			xhttp.DrainBody(resp.Body)
-			if resp.StatusCode != http.StatusOK {
-				return errors.New(resp.Status)
-			}
-			if v := resp.Header.Get(xhttp.MinIOServerStatus); v == unavailable {
-				return errors.New(v)
-			}
-			return nil
-		}); err != nil {
-			continue
-		}
-		return r.Idx
 	}
 	return -1
 }

@@ -18,11 +18,13 @@
 package cmd
 
 import (
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"time"
 
+	"github.com/cespare/xxhash/v2"
 	jsoniter "github.com/json-iterator/go"
 	"github.com/minio/minio/internal/logger"
 )
@@ -81,6 +83,9 @@ type xlMetaV1Object struct {
 type StatInfo struct {
 	Size    int64     `json:"size"`    // Size of the object `xl.meta`.
 	ModTime time.Time `json:"modTime"` // ModTime of the object `xl.meta`.
+	Name    string    `json:"name"`
+	Dir     bool      `json:"dir"`
+	Mode    uint32    `json:"mode"`
 }
 
 // ErasureInfo holds erasure coding and bitrot related information.
@@ -155,7 +160,7 @@ func (c ChecksumInfo) MarshalJSON() ([]byte, error) {
 // UnmarshalJSON - custom checksum info unmarshaller
 func (c *ChecksumInfo) UnmarshalJSON(data []byte) error {
 	var info checksumInfoJSON
-	var json = jsoniter.ConfigCompatibleWithStandardLibrary
+	json := jsoniter.ConfigCompatibleWithStandardLibrary
 	if err := json.Unmarshal(data, &info); err != nil {
 		return err
 	}
@@ -187,17 +192,41 @@ func (m *xlMetaV1Object) ToFileInfo(volume, path string) (FileInfo, error) {
 	}
 
 	fi := FileInfo{
-		Volume:    volume,
-		Name:      path,
-		ModTime:   m.Stat.ModTime,
-		Size:      m.Stat.Size,
-		Metadata:  m.Meta,
-		Parts:     m.Parts,
-		Erasure:   m.Erasure,
-		VersionID: m.VersionID,
-		DataDir:   m.DataDir,
+		Volume:      volume,
+		Name:        path,
+		ModTime:     m.Stat.ModTime,
+		Size:        m.Stat.Size,
+		Metadata:    m.Meta,
+		Parts:       m.Parts,
+		Erasure:     m.Erasure,
+		VersionID:   m.VersionID,
+		DataDir:     m.DataDir,
+		XLV1:        true,
+		NumVersions: 1,
 	}
+
 	return fi, nil
+}
+
+// Signature will return a signature that is expected to be the same across all disks.
+func (m *xlMetaV1Object) Signature() [4]byte {
+	// Shallow copy
+	c := *m
+	// Zero unimportant fields
+	c.Erasure.Index = 0
+	c.Minio.Release = ""
+	crc := hashDeterministicString(c.Meta)
+	c.Meta = nil
+
+	if bts, err := c.MarshalMsg(metaDataPoolGet()); err == nil {
+		crc ^= xxhash.Sum64(bts)
+		metaDataPoolPut(bts)
+	}
+
+	// Combine upper and lower part
+	var tmp [4]byte
+	binary.LittleEndian.PutUint32(tmp[:], uint32(crc^(crc>>32)))
+	return tmp
 }
 
 // XL metadata constants.

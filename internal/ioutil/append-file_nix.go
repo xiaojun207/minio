@@ -1,3 +1,4 @@
+//go:build !windows
 // +build !windows
 
 // Copyright (c) 2015-2021 MinIO, Inc.
@@ -28,9 +29,9 @@ import (
 func AppendFile(dst string, src string, osync bool) error {
 	flags := os.O_WRONLY | os.O_APPEND | os.O_CREATE
 	if osync {
-		flags = flags | os.O_SYNC
+		flags |= os.O_SYNC
 	}
-	appendFile, err := os.OpenFile(dst, flags, 0666)
+	appendFile, err := os.OpenFile(dst, flags, 0o666)
 	if err != nil {
 		return err
 	}

@@ -71,6 +71,9 @@ func getDefaultOpts(header http.Header, copySource bool, metadata map[string]str
 		opts.ProxyHeaderSet = true
 		opts.ProxyRequest = strings.Join(v, "") == "true"
 	}
+	if _, ok := header[xhttp.MinIOSourceReplicationRequest]; ok {
+		opts.ReplicationRequest = true
+	}
 	return
 }
 
@@ -153,7 +156,6 @@ func getOpts(ctx context.Context, r *http.Request, bucket, object string) (Objec
 				Err:    err,
 			}
 		}
-
 	}
 	return opts, nil
 }
@@ -183,23 +185,6 @@ func delOpts(ctx context.Context, r *http.Request, bucket, object string) (opts 
 		}
 	}
 
-	purgeVersion := strings.TrimSpace(r.Header.Get(xhttp.MinIOSourceDeleteMarkerDelete))
-	if purgeVersion != "" {
-		switch purgeVersion {
-		case "true":
-			opts.VersionPurgeStatus = Complete
-		case "false":
-		default:
-			err = fmt.Errorf("Unable to parse %s, failed with %w", xhttp.MinIOSourceDeleteMarkerDelete, fmt.Errorf("DeleteMarkerPurge should be true or false"))
-			logger.LogIf(ctx, err)
-			return opts, InvalidArgument{
-				Bucket: bucket,
-				Object: object,
-				Err:    err,
-			}
-		}
-	}
-
 	mtime := strings.TrimSpace(r.Header.Get(xhttp.MinIOSourceMTime))
 	if mtime != "" {
 		opts.MTime, err = time.Parse(time.RFC3339Nano, mtime)
@@ -219,6 +204,7 @@ func delOpts(ctx context.Context, r *http.Request, bucket, object string) (opts 
 // get ObjectOptions for PUT calls from encryption headers and metadata
 func putOpts(ctx context.Context, r *http.Request, bucket, object string, metadata map[string]string) (opts ObjectOptions, err error) {
 	versioned := globalBucketVersioningSys.Enabled(bucket)
+	versionSuspended := globalBucketVersioningSys.Suspended(bucket)
 	vid := strings.TrimSpace(r.Form.Get(xhttp.VersionID))
 	if vid != "" && vid != nullVersionID {
 		_, err := uuid.Parse(vid)
@@ -250,6 +236,44 @@ func putOpts(ctx context.Context, r *http.Request, bucket, object string, metada
 			}
 		}
 	}
+	retaintimeStr := strings.TrimSpace(r.Header.Get(xhttp.MinIOSourceObjectRetentionTimestamp))
+	retaintimestmp := mtime
+	if retaintimeStr != "" {
+		retaintimestmp, err = time.Parse(time.RFC3339, retaintimeStr)
+		if err != nil {
+			return opts, InvalidArgument{
+				Bucket: bucket,
+				Object: object,
+				Err:    fmt.Errorf("Unable to parse %s, failed with %w", xhttp.MinIOSourceObjectRetentionTimestamp, err),
+			}
+		}
+	}
+
+	lholdtimeStr := strings.TrimSpace(r.Header.Get(xhttp.MinIOSourceObjectLegalHoldTimestamp))
+	lholdtimestmp := mtime
+	if lholdtimeStr != "" {
+		lholdtimestmp, err = time.Parse(time.RFC3339, lholdtimeStr)
+		if err != nil {
+			return opts, InvalidArgument{
+				Bucket: bucket,
+				Object: object,
+				Err:    fmt.Errorf("Unable to parse %s, failed with %w", xhttp.MinIOSourceObjectLegalHoldTimestamp, err),
+			}
+		}
+	}
+	tagtimeStr := strings.TrimSpace(r.Header.Get(xhttp.MinIOSourceTaggingTimestamp))
+	taggingtimestmp := mtime
+	if tagtimeStr != "" {
+		taggingtimestmp, err = time.Parse(time.RFC3339, tagtimeStr)
+		if err != nil {
+			return opts, InvalidArgument{
+				Bucket: bucket,
+				Object: object,
+				Err:    fmt.Errorf("Unable to parse %s, failed with %w", xhttp.MinIOSourceTaggingTimestamp, err),
+			}
+		}
+	}
+
 	etag := strings.TrimSpace(r.Header.Get(xhttp.MinIOSourceETag))
 	if etag != "" {
 		if metadata == nil {
@@ -266,6 +290,7 @@ func putOpts(ctx context.Context, r *http.Request, bucket, object string, metada
 			UserDefined:          metadata,
 			VersionID:            vid,
 			Versioned:            versioned,
+			VersionSuspended:     versionSuspended,
 			MTime:                mtime,
 		}, nil
 	}
@@ -273,6 +298,7 @@ func putOpts(ctx context.Context, r *http.Request, bucket, object string, metada
 		opts, err = getOpts(ctx, r, bucket, object)
 		opts.VersionID = vid
 		opts.Versioned = versioned
+		opts.VersionSuspended = versionSuspended
 		opts.UserDefined = metadata
 		return
 	}
@@ -290,6 +316,7 @@ func putOpts(ctx context.Context, r *http.Request, bucket, object string, metada
 			UserDefined:          metadata,
 			VersionID:            vid,
 			Versioned:            versioned,
+			VersionSuspended:     versionSuspended,
 			MTime:                mtime,
 		}, nil
 	}
@@ -300,7 +327,11 @@ func putOpts(ctx context.Context, r *http.Request, bucket, object string, metada
 	}
 	opts.VersionID = vid
 	opts.Versioned = versioned
+	opts.VersionSuspended = versionSuspended
 	opts.MTime = mtime
+	opts.ReplicationSourceLegalholdTimestamp = lholdtimestmp
+	opts.ReplicationSourceRetentionTimestamp = retaintimestmp
+	opts.ReplicationSourceTaggingTimestamp = taggingtimestmp
 	return opts, nil
 }
 
@@ -352,5 +383,6 @@ func completeMultipartOpts(ctx context.Context, r *http.Request, bucket, object 
 		}
 	}
 	opts.MTime = mtime
+	opts.UserDefined = make(map[string]string)
 	return opts, nil
 }

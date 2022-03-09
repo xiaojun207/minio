@@ -25,9 +25,12 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	xhttp "github.com/minio/minio/internal/http"
+	"github.com/minio/minio/internal/logger/target/types"
 )
 
 // Timeout for the webhook http call
@@ -42,6 +45,7 @@ type Config struct {
 	AuthToken  string            `json:"authToken"`
 	ClientCert string            `json:"clientCert"`
 	ClientKey  string            `json:"clientKey"`
+	QueueSize  int               `json:"queueSize"`
 	Transport  http.RoundTripper `json:"-"`
 
 	// Custom logger
@@ -54,6 +58,9 @@ type Config struct {
 // buffer is full, new logs are just ignored and an error
 // is returned to the caller.
 type Target struct {
+	status int32
+	wg     sync.WaitGroup
+
 	// Channel of log entries
 	logCh chan interface{}
 
@@ -98,7 +105,7 @@ func (h *Target) Init() error {
 	// Drain any response.
 	xhttp.DrainBody(resp.Body)
 
-	if resp.StatusCode != http.StatusOK {
+	if !acceptedResponseStatusCode(resp.StatusCode) {
 		switch resp.StatusCode {
 		case http.StatusForbidden:
 			return fmt.Errorf("%s returned '%s', please check if your auth token is correctly set",
@@ -108,8 +115,66 @@ func (h *Target) Init() error {
 			h.config.Endpoint, resp.Status)
 	}
 
+	h.status = 1
 	go h.startHTTPLogger()
 	return nil
+}
+
+// Accepted HTTP Status Codes
+var acceptedStatusCodeMap = map[int]bool{http.StatusOK: true, http.StatusCreated: true, http.StatusAccepted: true, http.StatusNoContent: true}
+
+func acceptedResponseStatusCode(code int) bool {
+	return acceptedStatusCodeMap[code]
+}
+
+func (h *Target) logEntry(entry interface{}) {
+	h.wg.Add(1)
+	defer h.wg.Done()
+
+	logJSON, err := json.Marshal(&entry)
+	if err != nil {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), webhookCallTimeout)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		h.config.Endpoint, bytes.NewReader(logJSON))
+	if err != nil {
+		h.config.LogOnce(ctx, fmt.Errorf("%s returned '%w', please check your endpoint configuration", h.config.Endpoint, err), h.config.Endpoint)
+		cancel()
+		return
+	}
+	req.Header.Set(xhttp.ContentType, "application/json")
+	req.Header.Set(xhttp.MinIOVersion, xhttp.GlobalMinIOVersion)
+	req.Header.Set(xhttp.MinioDeploymentID, xhttp.GlobalDeploymentID)
+
+	// Set user-agent to indicate MinIO release
+	// version to the configured log endpoint
+	req.Header.Set("User-Agent", h.config.UserAgent)
+
+	if h.config.AuthToken != "" {
+		req.Header.Set("Authorization", h.config.AuthToken)
+	}
+
+	client := http.Client{Transport: h.config.Transport}
+	resp, err := client.Do(req)
+	cancel()
+	if err != nil {
+		h.config.LogOnce(ctx, fmt.Errorf("%s returned '%w', please check your endpoint configuration", h.config.Endpoint, err), h.config.Endpoint)
+		return
+	}
+
+	// Drain any response.
+	xhttp.DrainBody(resp.Body)
+
+	if !acceptedResponseStatusCode(resp.StatusCode) {
+		switch resp.StatusCode {
+		case http.StatusForbidden:
+			h.config.LogOnce(ctx, fmt.Errorf("%s returned '%s', please check if your auth token is correctly set", h.config.Endpoint, resp.Status), h.config.Endpoint)
+		default:
+			h.config.LogOnce(ctx, fmt.Errorf("%s returned '%s', please check your endpoint configuration", h.config.Endpoint, resp.Status), h.config.Endpoint)
+		}
+	}
 }
 
 func (h *Target) startHTTPLogger() {
@@ -117,47 +182,7 @@ func (h *Target) startHTTPLogger() {
 	// from an internal channel.
 	go func() {
 		for entry := range h.logCh {
-			logJSON, err := json.Marshal(&entry)
-			if err != nil {
-				continue
-			}
-
-			ctx, cancel := context.WithTimeout(context.Background(), webhookCallTimeout)
-			req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-				h.config.Endpoint, bytes.NewReader(logJSON))
-			if err != nil {
-				cancel()
-				continue
-			}
-			req.Header.Set(xhttp.ContentType, "application/json")
-
-			// Set user-agent to indicate MinIO release
-			// version to the configured log endpoint
-			req.Header.Set("User-Agent", h.config.UserAgent)
-
-			if h.config.AuthToken != "" {
-				req.Header.Set("Authorization", h.config.AuthToken)
-			}
-
-			client := http.Client{Transport: h.config.Transport}
-			resp, err := client.Do(req)
-			cancel()
-			if err != nil {
-				h.config.LogOnce(ctx, fmt.Errorf("%s returned '%w', please check your endpoint configuration", h.config.Endpoint, err), h.config.Endpoint)
-				continue
-			}
-
-			// Drain any response.
-			xhttp.DrainBody(resp.Body)
-
-			if resp.StatusCode != http.StatusOK {
-				switch resp.StatusCode {
-				case http.StatusForbidden:
-					h.config.LogOnce(ctx, fmt.Errorf("%s returned '%s', please check if your auth token is correctly set", h.config.Endpoint, resp.Status), h.config.Endpoint)
-				default:
-					h.config.LogOnce(ctx, fmt.Errorf("%s returned '%s', please check your endpoint configuration", h.config.Endpoint, resp.Status), h.config.Endpoint)
-				}
-			}
+			h.logEntry(entry)
 		}
 	}()
 }
@@ -166,7 +191,7 @@ func (h *Target) startHTTPLogger() {
 // sends log over http to the specified endpoint
 func New(config Config) *Target {
 	h := &Target{
-		logCh:  make(chan interface{}, 10000),
+		logCh:  make(chan interface{}, config.QueueSize),
 		config: config,
 	}
 
@@ -175,6 +200,11 @@ func New(config Config) *Target {
 
 // Send log message 'e' to http target.
 func (h *Target) Send(entry interface{}, errKind string) error {
+	if atomic.LoadInt32(&h.status) == 0 {
+		// Channel was closed or used before init.
+		return nil
+	}
+
 	select {
 	case h.logCh <- entry:
 	default:
@@ -184,4 +214,17 @@ func (h *Target) Send(entry interface{}, errKind string) error {
 	}
 
 	return nil
+}
+
+// Cancel - cancels the target
+func (h *Target) Cancel() {
+	if atomic.CompareAndSwapInt32(&h.status, 1, 0) {
+		close(h.logCh)
+	}
+	h.wg.Wait()
+}
+
+// Type - returns type of the target
+func (h *Target) Type() types.TargetType {
+	return types.TargetHTTP
 }

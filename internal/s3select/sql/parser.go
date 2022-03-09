@@ -31,7 +31,7 @@ type Boolean bool
 
 // Capture interface used by participle
 func (b *Boolean) Capture(values []string) error {
-	*b = strings.ToLower(values[0]) == "true"
+	*b = Boolean(strings.EqualFold(values[0], "true"))
 	return nil
 }
 
@@ -44,7 +44,7 @@ func (ls *LiteralString) Capture(values []string) error {
 	n := len(values[0])
 	r := values[0][1 : n-1]
 	// Translate doubled quotes
-	*ls = LiteralString(strings.Replace(r, "''", "'", -1))
+	*ls = LiteralString(strings.ReplaceAll(r, "''", "'"))
 	return nil
 }
 
@@ -78,7 +78,7 @@ func (qi *QuotedIdentifier) Capture(values []string) error {
 	r := values[0][1 : n-1]
 
 	// Translate doubled quotes
-	*qi = QuotedIdentifier(strings.Replace(r, `""`, `"`, -1))
+	*qi = QuotedIdentifier(strings.ReplaceAll(r, `""`, `"`))
 	return nil
 }
 
@@ -184,7 +184,7 @@ type ConditionRHS struct {
 
 // Compare represents the RHS of a comparison expression
 type Compare struct {
-	Operator string   `parser:"@( \"<>\" | \"<=\" | \">=\" | \"=\" | \"<\" | \">\" | \"!=\" )"`
+	Operator string   `parser:"@( \"<>\" | \"<=\" | \">=\" | \"=\" | \"<\" | \">\" | \"!=\" | \"IS\" \"NOT\" | \"IS\")"`
 	Operand  *Operand `parser:"  @@"`
 }
 
@@ -340,7 +340,8 @@ type LitValue struct {
 	Int     *float64       `parser:" | @Int"` // To avoid value out of range, use float64 instead
 	String  *LiteralString `parser:" | @LitString"`
 	Boolean *Boolean       `parser:" | @(\"TRUE\" | \"FALSE\")"`
-	Null    bool           `parser:" | @\"NULL\")"`
+	Null    bool           `parser:" | @\"NULL\""`
+	Missing bool           `parser:" | @\"MISSING\")"`
 }
 
 // Identifier represents a parsed identifier
@@ -352,7 +353,7 @@ type Identifier struct {
 var (
 	sqlLexer = lexer.Must(lexer.Regexp(`(\s+)` +
 		`|(?P<Timeword>(?i)\b(?:YEAR|MONTH|DAY|HOUR|MINUTE|SECOND|TIMEZONE_HOUR|TIMEZONE_MINUTE)\b)` +
-		`|(?P<Keyword>(?i)\b(?:SELECT|FROM|TOP|DISTINCT|ALL|WHERE|GROUP|BY|HAVING|UNION|MINUS|EXCEPT|INTERSECT|ORDER|LIMIT|OFFSET|TRUE|FALSE|NULL|IS|NOT|ANY|SOME|BETWEEN|AND|OR|LIKE|ESCAPE|AS|IN|BOOL|INT|INTEGER|STRING|FLOAT|DECIMAL|NUMERIC|TIMESTAMP|AVG|COUNT|MAX|MIN|SUM|COALESCE|NULLIF|CAST|DATE_ADD|DATE_DIFF|EXTRACT|TO_STRING|TO_TIMESTAMP|UTCNOW|CHAR_LENGTH|CHARACTER_LENGTH|LOWER|SUBSTRING|TRIM|UPPER|LEADING|TRAILING|BOTH|FOR)\b)` +
+		`|(?P<Keyword>(?i)\b(?:SELECT|FROM|TOP|DISTINCT|ALL|WHERE|GROUP|BY|HAVING|UNION|MINUS|EXCEPT|INTERSECT|ORDER|LIMIT|OFFSET|TRUE|FALSE|NULL|IS|NOT|ANY|SOME|BETWEEN|AND|OR|LIKE|ESCAPE|AS|IN|BOOL|INT|INTEGER|STRING|FLOAT|DECIMAL|NUMERIC|TIMESTAMP|AVG|COUNT|MAX|MIN|SUM|COALESCE|NULLIF|CAST|DATE_ADD|DATE_DIFF|EXTRACT|TO_STRING|TO_TIMESTAMP|UTCNOW|CHAR_LENGTH|CHARACTER_LENGTH|LOWER|SUBSTRING|TRIM|UPPER|LEADING|TRAILING|BOTH|FOR|MISSING)\b)` +
 		`|(?P<Ident>[a-zA-Z_][a-zA-Z0-9_]*)` +
 		`|(?P<QuotIdent>"([^"]*("")?)*")` +
 		`|(?P<Float>\d*\.\d+([eE][-+]?\d+)?)` +

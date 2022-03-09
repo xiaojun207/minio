@@ -90,7 +90,7 @@ func (key ObjectKey) Seal(extKey []byte, iv [32]byte, domain, bucket, object str
 		sealingKey   [32]byte
 		encryptedKey bytes.Buffer
 	)
-	mac := hmac.New(sha256.New, extKey[:])
+	mac := hmac.New(sha256.New, extKey)
 	mac.Write(iv[:])
 	mac.Write([]byte(domain))
 	mac.Write([]byte(SealAlgorithm))
@@ -111,14 +111,12 @@ func (key ObjectKey) Seal(extKey []byte, iv [32]byte, domain, bucket, object str
 // may be cryptographically bound to the object's path the same bucket/object as during sealing
 // must be provided. On success the ObjectKey contains the decrypted sealed key.
 func (key *ObjectKey) Unseal(extKey []byte, sealedKey SealedKey, domain, bucket, object string) error {
-	var (
-		unsealConfig sio.Config
-	)
+	var unsealConfig sio.Config
 	switch sealedKey.Algorithm {
 	default:
 		return Errorf("The sealing algorithm '%s' is not supported", sealedKey.Algorithm)
 	case SealAlgorithm:
-		mac := hmac.New(sha256.New, extKey[:])
+		mac := hmac.New(sha256.New, extKey)
 		mac.Write(sealedKey.IV[:])
 		mac.Write([]byte(domain))
 		mac.Write([]byte(SealAlgorithm))
@@ -126,7 +124,7 @@ func (key *ObjectKey) Unseal(extKey []byte, sealedKey SealedKey, domain, bucket,
 		unsealConfig = sio.Config{MinVersion: sio.Version20, Key: mac.Sum(nil), CipherSuites: fips.CipherSuitesDARE()}
 	case InsecureSealAlgorithm:
 		sha := sha256.New()
-		sha.Write(extKey[:])
+		sha.Write(extKey)
 		sha.Write(sealedKey.IV[:])
 		unsealConfig = sio.Config{MinVersion: sio.Version10, Key: sha.Sum(nil), CipherSuites: fips.CipherSuitesDARE()}
 	}

@@ -18,12 +18,17 @@
 package cmd
 
 import (
+	"encoding/base64"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 
 	"github.com/gorilla/mux"
+	"github.com/minio/kes"
+	"github.com/minio/madmin-go"
+	"github.com/minio/minio/internal/kms"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/pkg/bucket/policy"
 )
@@ -82,6 +87,19 @@ func (api objectAPIHandlers) PutBucketEncryptionHandler(w http.ResponseWriter, r
 		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrKMSNotConfigured), r.URL)
 		return
 	}
+	kmsKey := encConfig.KeyID()
+	if kmsKey != "" {
+		kmsContext := kms.Context{"MinIO admin API": "ServerInfoHandler"} // Context for a test key operation
+		_, err := GlobalKMS.GenerateKey(kmsKey, kmsContext)
+		if err != nil {
+			if errors.Is(err, kes.ErrKeyNotFound) {
+				writeErrorResponse(ctx, w, toAPIError(ctx, errKMSKeyNotFound), r.URL)
+				return
+			}
+			writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
+			return
+		}
+	}
 
 	configData, err := xml.Marshal(encConfig)
 	if err != nil {
@@ -90,7 +108,21 @@ func (api objectAPIHandlers) PutBucketEncryptionHandler(w http.ResponseWriter, r
 	}
 
 	// Store the bucket encryption configuration in the object layer
-	if err = globalBucketMetadataSys.Update(bucket, bucketSSEConfig, configData); err != nil {
+	if err = globalBucketMetadataSys.Update(ctx, bucket, bucketSSEConfig, configData); err != nil {
+		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
+		return
+	}
+
+	// Call site replication hook.
+	//
+	// We encode the xml bytes as base64 to ensure there are no encoding
+	// errors.
+	cfgStr := base64.StdEncoding.EncodeToString(configData)
+	if err = globalSiteReplicationSys.BucketMetaHook(ctx, madmin.SRBucketMeta{
+		Type:      madmin.SRBucketMetaTypeSSEConfig,
+		Bucket:    bucket,
+		SSEConfig: &cfgStr,
+	}); err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
 	}
@@ -170,7 +202,7 @@ func (api objectAPIHandlers) DeleteBucketEncryptionHandler(w http.ResponseWriter
 	}
 
 	// Delete bucket encryption config from object layer
-	if err = globalBucketMetadataSys.Update(bucket, bucketSSEConfig, nil); err != nil {
+	if err = globalBucketMetadataSys.Update(ctx, bucket, bucketSSEConfig, nil); err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
 	}

@@ -30,7 +30,6 @@ import (
 )
 
 const (
-	bucketConfigPrefix       = "buckets"
 	bucketNotificationConfig = "notification.xml"
 )
 
@@ -72,8 +71,8 @@ func (api objectAPIHandlers) GetBucketNotificationHandler(w http.ResponseWriter,
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
 	}
-	config.SetRegion(globalServerRegion)
-	if err = config.Validate(globalServerRegion, globalNotificationSys.targetList); err != nil {
+	config.SetRegion(globalSite.Region)
+	if err = config.Validate(globalSite.Region, globalNotificationSys.targetList); err != nil {
 		arnErr, ok := err.(*event.ErrARNNotFound)
 		if ok {
 			for i, queue := range config.QueueList {
@@ -145,7 +144,7 @@ func (api objectAPIHandlers) PutBucketNotificationHandler(w http.ResponseWriter,
 		return
 	}
 
-	config, err := event.ParseConfig(io.LimitReader(r.Body, r.ContentLength), globalServerRegion, globalNotificationSys.targetList)
+	config, err := event.ParseConfig(io.LimitReader(r.Body, r.ContentLength), globalSite.Region, globalNotificationSys.targetList)
 	if err != nil {
 		apiErr := errorCodes.ToAPIErr(ErrMalformedXML)
 		if event.IsEventError(err) {
@@ -161,7 +160,7 @@ func (api objectAPIHandlers) PutBucketNotificationHandler(w http.ResponseWriter,
 		return
 	}
 
-	if err = globalBucketMetadataSys.Update(bucketName, bucketNotificationConfig, configData); err != nil {
+	if err = globalBucketMetadataSys.Update(ctx, bucketName, bucketNotificationConfig, configData); err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
 	}

@@ -27,6 +27,8 @@ import (
 	"google.golang.org/api/googleapi"
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
+
+	xioutil "github.com/minio/minio/internal/ioutil"
 )
 
 type warmBackendGCS struct {
@@ -49,12 +51,12 @@ func (gcs *warmBackendGCS) getDest(object string) string {
 
 func (gcs *warmBackendGCS) Put(ctx context.Context, key string, data io.Reader, length int64) (remoteVersionID, error) {
 	object := gcs.client.Bucket(gcs.Bucket).Object(gcs.getDest(key))
-	//TODO: set storage class
+	// TODO: set storage class
 	w := object.NewWriter(ctx)
 	if gcs.StorageClass != "" {
 		w.ObjectAttrs.StorageClass = gcs.StorageClass
 	}
-	if _, err := io.Copy(w, data); err != nil {
+	if _, err := xioutil.Copy(w, data); err != nil {
 		return "", gcsToObjectError(err, gcs.Bucket, key)
 	}
 
@@ -72,7 +74,6 @@ func (gcs *warmBackendGCS) Get(ctx context.Context, key string, rv remoteVersion
 	r, err = object.NewRangeReader(ctx, opts.startOffset, opts.length)
 	if err != nil {
 		return nil, gcsToObjectError(err, gcs.Bucket, key)
-
 	}
 	return r, nil
 }

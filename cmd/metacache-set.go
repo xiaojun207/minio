@@ -91,6 +91,9 @@ type listPathOptions struct {
 	// A transient result will never be returned from the cache so knowing the list id is required.
 	Transient bool
 
+	// Versioned is this a ListObjectVersions call.
+	Versioned bool
+
 	// pool and set of where the cache is located.
 	pool, set int
 }
@@ -131,21 +134,32 @@ func (o *listPathOptions) debugln(data ...interface{}) {
 
 // gatherResults will collect all results on the input channel and filter results according to the options.
 // Caller should close the channel when done.
-// The returned function will return the results once there is enough or input is closed.
-func (o *listPathOptions) gatherResults(in <-chan metaCacheEntry) func() (metaCacheEntriesSorted, error) {
-	var resultsDone = make(chan metaCacheEntriesSorted)
+// The returned function will return the results once there is enough or input is closed,
+// or the context is canceled.
+func (o *listPathOptions) gatherResults(ctx context.Context, in <-chan metaCacheEntry) func() (metaCacheEntriesSorted, error) {
+	resultsDone := make(chan metaCacheEntriesSorted)
 	// Copy so we can mutate
 	resCh := resultsDone
+	var done bool
+	var mu sync.Mutex
 	resErr := io.EOF
 
 	go func() {
 		var results metaCacheEntriesSorted
+		var returned bool
 		for entry := range in {
-			if resCh == nil {
+			if returned {
 				// past limit
 				continue
 			}
-			if !o.IncludeDirectories && entry.isDir() {
+			mu.Lock()
+			returned = done
+			mu.Unlock()
+			if returned {
+				resCh = nil
+				continue
+			}
+			if !o.IncludeDirectories && (entry.isDir() || (!o.Versioned && entry.isObjectDir() && entry.isLatestDeletemarker())) {
 				continue
 			}
 			if o.Marker != "" && entry.name < o.Marker {
@@ -157,7 +171,7 @@ func (o *listPathOptions) gatherResults(in <-chan metaCacheEntry) func() (metaCa
 			if !o.Recursive && !entry.isInDir(o.Prefix, o.Separator) {
 				continue
 			}
-			if !o.InclDeleted && entry.isObject() && entry.isLatestDeletemarker() {
+			if !o.InclDeleted && entry.isObject() && entry.isLatestDeletemarker() && !entry.isObjectDir() {
 				continue
 			}
 			if o.Limit > 0 && results.len() >= o.Limit {
@@ -167,6 +181,7 @@ func (o *listPathOptions) gatherResults(in <-chan metaCacheEntry) func() (metaCa
 					resErr = nil
 					resCh <- results
 					resCh = nil
+					returned = true
 				}
 				continue
 			}
@@ -178,7 +193,15 @@ func (o *listPathOptions) gatherResults(in <-chan metaCacheEntry) func() (metaCa
 		}
 	}()
 	return func() (metaCacheEntriesSorted, error) {
-		return <-resultsDone, resErr
+		select {
+		case <-ctx.Done():
+			mu.Lock()
+			done = true
+			mu.Unlock()
+			return metaCacheEntriesSorted{}, ctx.Err()
+		case r := <-resultsDone:
+			return r, resErr
+		}
 	}
 }
 
@@ -195,7 +218,7 @@ func (o *listPathOptions) findFirstPart(fi FileInfo) (int, error) {
 	}
 	o.debugln("searching for ", search)
 	var tmp metacacheBlock
-	var json = jsoniter.ConfigCompatibleWithStandardLibrary
+	json := jsoniter.ConfigCompatibleWithStandardLibrary
 	i := 0
 	for {
 		partKey := fmt.Sprintf("%s-metacache-part-%d", ReservedMetadataPrefixLower, i)
@@ -304,13 +327,13 @@ func (r *metacacheReader) filter(o listPathOptions) (entries metaCacheEntriesSor
 				pastPrefix = true
 				return false
 			}
-			if !o.IncludeDirectories && entry.isDir() {
+			if !o.IncludeDirectories && (entry.isDir() || (!o.Versioned && entry.isObjectDir() && entry.isLatestDeletemarker())) {
 				return true
 			}
 			if !entry.isInDir(o.Prefix, o.Separator) {
 				return true
 			}
-			if !o.InclDeleted && entry.isObject() && entry.isLatestDeletemarker() {
+			if !o.InclDeleted && entry.isObject() && entry.isLatestDeletemarker() && !entry.isObjectDir() {
 				return entries.len() < o.Limit
 			}
 			entries.o = append(entries.o, entry)
@@ -323,7 +346,7 @@ func (r *metacacheReader) filter(o listPathOptions) (entries metaCacheEntriesSor
 	}
 
 	// We should not need to filter more.
-	return r.readN(o.Limit, o.InclDeleted, o.IncludeDirectories, o.Prefix)
+	return r.readN(o.Limit, o.InclDeleted, o.IncludeDirectories, o.Versioned, o.Prefix)
 }
 
 func (er *erasureObjects) streamMetadataParts(ctx context.Context, o listPathOptions) (entries metaCacheEntriesSorted, err error) {
@@ -331,10 +354,8 @@ func (er *erasureObjects) streamMetadataParts(ctx context.Context, o listPathOpt
 	rpc := globalNotificationSys.restClientFromHash(o.Bucket)
 
 	for {
-		select {
-		case <-ctx.Done():
+		if contextCanceled(ctx) {
 			return entries, ctx.Err()
-		default:
 		}
 
 		// If many failures, check the cache state.
@@ -346,13 +367,15 @@ func (er *erasureObjects) streamMetadataParts(ctx context.Context, o listPathOpt
 			retries = 1
 		}
 
-		const retryDelay = 500 * time.Millisecond
-		// Load first part metadata...
+		const retryDelay = 250 * time.Millisecond
 		// All operations are performed without locks, so we must be careful and allow for failures.
 		// Read metadata associated with the object from a disk.
 		if retries > 0 {
 			for _, disk := range er.getDisks() {
 				if disk == nil {
+					continue
+				}
+				if !disk.IsOnline() {
 					continue
 				}
 				_, err := disk.ReadVersion(ctx, minioMetaBucket,
@@ -366,6 +389,7 @@ func (er *erasureObjects) streamMetadataParts(ctx context.Context, o listPathOpt
 			}
 		}
 
+		// Load first part metadata...
 		// Read metadata associated with the object from all disks.
 		fi, metaArr, onlineDisks, err := er.getObjectFileInfo(ctx, minioMetaBucket, o.objectPath(0), ObjectOptions{}, true)
 		if err != nil {
@@ -404,10 +428,8 @@ func (er *erasureObjects) streamMetadataParts(ctx context.Context, o listPathOpt
 		// We got a stream to start at.
 		loadedPart := 0
 		for {
-			select {
-			case <-ctx.Done():
+			if contextCanceled(ctx) {
 				return entries, ctx.Err()
-			default:
 			}
 
 			if partN != loadedPart {
@@ -425,6 +447,9 @@ func (er *erasureObjects) streamMetadataParts(ctx context.Context, o listPathOpt
 						if disk == nil {
 							continue
 						}
+						if !disk.IsOnline() {
+							continue
+						}
 						_, err := disk.ReadVersion(ctx, minioMetaBucket,
 							o.objectPath(partN), "", false)
 						if err != nil {
@@ -436,7 +461,7 @@ func (er *erasureObjects) streamMetadataParts(ctx context.Context, o listPathOpt
 					}
 				}
 
-				// Load first part metadata...
+				// Load partN metadata...
 				fi, metaArr, onlineDisks, err = er.getObjectFileInfo(ctx, minioMetaBucket, o.objectPath(partN), ObjectOptions{}, true)
 				if err != nil {
 					time.Sleep(retryDelay)
@@ -517,13 +542,9 @@ func (er *erasureObjects) listPath(ctx context.Context, o listPathOptions, resul
 	var fallbackDisks []StorageAPI
 
 	// Special case: ask all disks if the drive count is 4
-	if askDisks == -1 || er.setDriveCount == 4 {
-		askDisks = len(disks) // with 'strict' quorum list on all online disks.
-		listingQuorum = getReadQuorum(er.setDriveCount)
-	}
-	if askDisks == 0 {
-		askDisks = globalAPIConfig.getListQuorum()
-		listingQuorum = askDisks
+	if askDisks <= 0 || er.setDriveCount == 4 {
+		askDisks = len(disks)          // with 'strict' quorum list on all online disks.
+		listingQuorum = len(disks) / 2 // keep this such that we can list all objects with different quorum ratio.
 	}
 	if askDisks > 0 && len(disks) > askDisks {
 		rand.Shuffle(len(disks), func(i, j int) {
@@ -579,7 +600,7 @@ type metaCacheRPC struct {
 
 func (m *metaCacheRPC) setErr(err string) {
 	m.mu.Lock()
-	defer m.mu.Lock()
+	defer m.mu.Unlock()
 	meta := *m.meta
 	if meta.status != scanStateError {
 		meta.error = err
@@ -623,11 +644,20 @@ func (er *erasureObjects) saveMetaCacheStream(ctx context.Context, mc *metaCache
 			metaMu.Lock()
 			meta := *mc.meta
 			meta, err = o.updateMetacacheListing(meta, rpc)
-			*mc.meta = meta
-			if meta.status == scanStateError {
-				logger.LogIf(ctx, err)
+			if err == nil && time.Since(meta.lastHandout) > metacacheMaxClientWait {
 				cancel()
 				exit = true
+				meta.status = scanStateError
+				meta.error = fmt.Sprintf("listing canceled since time since last handout was %v ago", time.Since(meta.lastHandout).Round(time.Second))
+				o.debugln(color.Green("saveMetaCacheStream: ") + meta.error)
+				meta, err = o.updateMetacacheListing(meta, rpc)
+			}
+			if err == nil {
+				*mc.meta = meta
+				if meta.status == scanStateError {
+					cancel()
+					exit = true
+				}
 			}
 			metaMu.Unlock()
 		}
@@ -644,7 +674,7 @@ func (er *erasureObjects) saveMetaCacheStream(ctx context.Context, mc *metaCache
 		if len(b.data) == 0 && b.n == 0 && o.Transient {
 			return nil
 		}
-		o.debugln(color.Green("listPath:")+" saving block", b.n, "to", o.objectPath(b.n))
+		o.debugln(color.Green("saveMetaCacheStream:")+" saving block", b.n, "to", o.objectPath(b.n))
 		r, err := hash.NewReader(bytes.NewReader(b.data), int64(len(b.data)), "", "", int64(len(b.data)))
 		logger.LogIf(ctx, err)
 		custom := b.headerKV()
@@ -669,12 +699,14 @@ func (er *erasureObjects) saveMetaCacheStream(ctx context.Context, mc *metaCache
 			for k, v := range meta {
 				fi.Metadata[k] = v
 			}
-			err := er.updateObjectMeta(ctx, minioMetaBucket, o.objectPath(0), fi)
+			err := er.updateObjectMeta(ctx, minioMetaBucket, o.objectPath(0), fi, er.getDisks())
 			if err == nil {
 				break
 			}
 			switch err.(type) {
 			case ObjectNotFound:
+				return err
+			case StorageErr:
 				return err
 			case InsufficientReadQuorum:
 			default:
@@ -689,26 +721,23 @@ func (er *erasureObjects) saveMetaCacheStream(ctx context.Context, mc *metaCache
 		return nil
 	})
 
-	metaMu.Lock()
+	// Blocks while consuming entries or an error occurs.
+	err = bw.Close()
 	if err != nil {
 		mc.setErr(err.Error())
-		return
+	}
+	metaMu.Lock()
+	defer metaMu.Unlock()
+	if mc.meta.error != "" {
+		return err
 	}
 	// Save success
-	if mc.meta.error == "" {
-		mc.meta.status = scanStateSuccess
+	mc.meta.status = scanStateSuccess
+	meta, err := o.updateMetacacheListing(*mc.meta, rpc)
+	if err == nil {
+		*mc.meta = meta
 	}
-
-	meta := *mc.meta
-	meta, _ = o.updateMetacacheListing(meta, rpc)
-	*mc.meta = meta
-	metaMu.Unlock()
-
-	if err := bw.Close(); err != nil {
-		mc.setErr(err.Error())
-	}
-
-	return
+	return nil
 }
 
 type listPathRawOptions struct {
@@ -734,7 +763,7 @@ type listPathRawOptions struct {
 	// agreed is called if all disks agreed.
 	agreed func(entry metaCacheEntry)
 
-	// partial will be returned when there is disagreement between disks.
+	// partial will be called when there is disagreement between disks.
 	// if disk did not return any result, but also haven't errored
 	// the entry will be empty and errs will
 	partial func(entries metaCacheEntries, nAgreed int, errs []error)
@@ -761,11 +790,13 @@ func listPathRaw(ctx context.Context, opts listPathRawOptions) (err error) {
 	defer cancel()
 
 	fallback := func(err error) bool {
-		if err == nil {
-			return false
+		switch err.(type) {
+		case StorageErr:
+			// all supported disk errors
+			// attempt a fallback.
+			return true
 		}
-		return err.Error() == errUnformattedDisk.Error() ||
-			err.Error() == errVolumeNotFound.Error()
+		return false
 	}
 	askDisks := len(disks)
 	readers := make([]*metacacheReader, askDisks)
@@ -820,6 +851,8 @@ func listPathRaw(ctx context.Context, opts listPathRawOptions) (err error) {
 			if werr != io.EOF && werr != nil &&
 				werr.Error() != errFileNotFound.Error() &&
 				werr.Error() != errVolumeNotFound.Error() &&
+				werr.Error() != errDiskNotFound.Error() &&
+				werr.Error() != errUnformattedDisk.Error() &&
 				!errors.Is(werr, context.Canceled) {
 				logger.LogIf(ctx, werr)
 			}
@@ -850,12 +883,11 @@ func listPathRaw(ctx context.Context, opts listPathRawOptions) (err error) {
 				continue
 			case nil:
 			default:
-				if err.Error() == errFileNotFound.Error() {
-					atEOF++
-					fnf++
-					continue
-				}
-				if err.Error() == errVolumeNotFound.Error() {
+				switch err.Error() {
+				case errFileNotFound.Error(),
+					errVolumeNotFound.Error(),
+					errUnformattedDisk.Error(),
+					errDiskNotFound.Error():
 					atEOF++
 					fnf++
 					continue
@@ -872,7 +904,7 @@ func listPathRaw(ctx context.Context, opts listPathRawOptions) (err error) {
 				continue
 			}
 			// If exact match, we agree.
-			if current.matches(&entry, opts.bucket) {
+			if _, ok := current.matches(&entry, true); ok {
 				topEntries[i] = entry
 				agree++
 				continue

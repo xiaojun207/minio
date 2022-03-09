@@ -102,15 +102,14 @@ func mustGetLocalIP6() (ipList set.StringSet) {
 
 // getHostIP returns IP address of given host.
 func getHostIP(host string) (ipList set.StringSet, err error) {
-	var ips []net.IP
-
-	if ips, err = net.LookupIP(host); err != nil {
+	addrs, err := globalDNSCache.LookupHost(GlobalContext, host)
+	if err != nil {
 		return ipList, err
 	}
 
 	ipList = set.NewStringSet()
-	for _, ip := range ips {
-		ipList.Add(ip.String())
+	for _, addr := range addrs {
+		ipList.Add(addr)
 	}
 
 	return ipList, err
@@ -325,7 +324,6 @@ func isLocalHost(host string, port string, localPort string) (bool, error) {
 // formats, point to the same machine, e.g:
 //  ':9000' and 'http://localhost:9000/' will return true
 func sameLocalAddrs(addr1, addr2 string) (bool, error) {
-
 	// Extract host & port from given parameters
 	host1, port1, err := extractHostPort(addr1)
 	if err != nil {
@@ -341,21 +339,17 @@ func sameLocalAddrs(addr1, addr2 string) (bool, error) {
 	if host1 == "" {
 		// If empty host means it is localhost
 		addr1Local = true
-	} else {
+	} else if addr1Local, err = isLocalHost(host1, port1, port1); err != nil {
 		// Host not empty, check if it is local
-		if addr1Local, err = isLocalHost(host1, port1, port1); err != nil {
-			return false, err
-		}
+		return false, err
 	}
 
 	if host2 == "" {
 		// If empty host means it is localhost
 		addr2Local = true
-	} else {
+	} else if addr2Local, err = isLocalHost(host2, port2, port2); err != nil {
 		// Host not empty, check if it is local
-		if addr2Local, err = isLocalHost(host2, port2, port2); err != nil {
-			return false, err
-		}
+		return false, err
 	}
 
 	// If both of addresses point to the same machine, check if

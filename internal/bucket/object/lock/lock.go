@@ -121,9 +121,7 @@ const (
 	ntpServerEnv = "MINIO_NTP_SERVER"
 )
 
-var (
-	ntpServer = env.Get(ntpServerEnv, "")
-)
+var ntpServer = env.Get(ntpServerEnv, "")
 
 // UTCNowNTP - is similar in functionality to UTCNow()
 // but only used when we do not wish to rely on system
@@ -193,6 +191,7 @@ func (dr *DefaultRetention) UnmarshalXML(d *xml.Decoder, start xml.StartElement)
 		return fmt.Errorf("either Days or Years must be specified, not both")
 	}
 
+	//nolint:gocritic
 	if retention.Days != nil {
 		if *retention.Days == 0 {
 			return fmt.Errorf("Default retention period must be a positive integer value for 'Days'")
@@ -382,7 +381,7 @@ func IsObjectLockLegalHoldRequested(h http.Header) bool {
 
 // IsObjectLockGovernanceBypassSet returns true if object lock governance bypass header is set.
 func IsObjectLockGovernanceBypassSet(h http.Header) bool {
-	return strings.ToLower(h.Get(AmzObjectLockBypassRetGovernance)) == "true"
+	return strings.EqualFold(h.Get(AmzObjectLockBypassRetGovernance), "true")
 }
 
 // IsObjectLockRequested returns true if legal hold or object lock retention headers are requested.
@@ -423,7 +422,6 @@ func ParseObjectLockRetentionHeaders(h http.Header) (rmode RetMode, r RetentionD
 	}
 
 	return rmode, RetentionDate{retDate}, nil
-
 }
 
 // GetObjectRetentionMeta constructs ObjectRetention from metadata
@@ -479,7 +477,6 @@ func ParseObjectLockLegalHoldHeaders(h http.Header) (lhold ObjectLegalHold, err 
 		lhold = ObjectLegalHold{XMLNS: "http://s3.amazonaws.com/doc/2006-03-01/", Status: lh}
 	}
 	return lhold, nil
-
 }
 
 // ObjectLegalHold specified in
@@ -534,7 +531,7 @@ func (l *ObjectLegalHold) IsEmpty() bool {
 func ParseObjectLegalHold(reader io.Reader) (hold *ObjectLegalHold, err error) {
 	hold = &ObjectLegalHold{}
 	if err = xml.NewDecoder(reader).Decode(hold); err != nil {
-		return
+		return nil, err
 	}
 
 	if !hold.Status.Valid() {

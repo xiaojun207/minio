@@ -52,7 +52,7 @@ var globalObjLayerMutex sync.RWMutex
 // Global object layer, only accessed by globalObjectAPI.
 var globalObjectAPI ObjectLayer
 
-//Global cacheObjects, only accessed by newCacheObjectsFn().
+// Global cacheObjects, only accessed by newCacheObjectsFn().
 var globalCacheObjectAPI CacheObjectLayer
 
 // Checks if the object is a directory, this logic uses
@@ -164,6 +164,8 @@ func listObjectsNonSlash(ctx context.Context, bucket, prefix, marker, delimiter 
 		result.IsTruncated = true
 		if len(objInfos) > 0 {
 			result.NextMarker = objInfos[len(objInfos)-1].Name
+		} else if len(result.Prefixes) > 0 {
+			result.NextMarker = result.Prefixes[len(result.Prefixes)-1]
 		}
 	}
 
@@ -247,6 +249,21 @@ func listObjects(ctx context.Context, obj ObjectLayer, bucket, prefix, marker, d
 		return loi, nil
 	}
 
+	if len(prefix) > 0 && maxKeys == 1 && delimiter == "" && marker == "" {
+		// Optimization for certain applications like
+		// - Cohesity
+		// - Actifio, Splunk etc.
+		// which send ListObjects requests where the actual object
+		// itself is the prefix and max-keys=1 in such scenarios
+		// we can simply verify locally if such an object exists
+		// to avoid the need for ListObjects().
+		objInfo, err := obj.GetObjectInfo(ctx, bucket, prefix, ObjectOptions{NoLock: true})
+		if err == nil {
+			loi.Objects = append(loi.Objects, objInfo)
+			return loi, nil
+		}
+	}
+
 	// For delimiter and prefix as '/' we do not list anything at all
 	// since according to s3 spec we stop at the 'delimiter'
 	// along // with the prefix. On a flat namespace with 'prefix'
@@ -276,10 +293,13 @@ func listObjects(ctx context.Context, obj ObjectLayer, bucket, prefix, marker, d
 	var eof bool
 	var nextMarker string
 
+	maxConcurrent := maxKeys / 10
+	if maxConcurrent == 0 {
+		maxConcurrent = maxKeys
+	}
+
 	// List until maxKeys requested.
-	g := errgroup.WithNErrs(maxKeys).WithConcurrency(10)
-	ctx, cancel := g.WithCancelOnError(ctx)
-	defer cancel()
+	g := errgroup.WithNErrs(maxKeys).WithConcurrency(maxConcurrent)
 
 	objInfoFound := make([]*ObjectInfo, maxKeys)
 	var i int
@@ -287,6 +307,13 @@ func listObjects(ctx context.Context, obj ObjectLayer, bucket, prefix, marker, d
 		i := i
 		walkResult, ok := <-walkResultCh
 		if !ok {
+			if HasSuffix(prefix, SlashSeparator) {
+				objInfo, err := obj.GetObjectInfo(ctx, bucket, prefix, ObjectOptions{NoLock: true})
+				if err == nil {
+					loi.Objects = append(loi.Objects, objInfo)
+					return loi, nil
+				}
+			}
 			// Closed channel.
 			eof = true
 			break
@@ -340,8 +367,10 @@ func listObjects(ctx context.Context, obj ObjectLayer, bucket, prefix, marker, d
 			break
 		}
 	}
-	if err := g.WaitErr(); err != nil {
-		return loi, err
+	for _, err := range g.Wait() {
+		if err != nil {
+			return loi, err
+		}
 	}
 	// Copy found objects
 	objInfos := make([]ObjectInfo, 0, i+1)
@@ -372,6 +401,8 @@ func listObjects(ctx context.Context, obj ObjectLayer, bucket, prefix, marker, d
 		result.IsTruncated = true
 		if len(objInfos) > 0 {
 			result.NextMarker = objInfos[len(objInfos)-1].Name
+		} else if len(result.Prefixes) > 0 {
+			result.NextMarker = result.Prefixes[len(result.Prefixes)-1]
 		}
 	}
 

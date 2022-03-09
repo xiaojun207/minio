@@ -39,18 +39,27 @@ import (
 	"runtime/trace"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
-	humanize "github.com/dustin/go-humanize"
+	"github.com/coreos/go-oidc"
+	"github.com/dustin/go-humanize"
+	"github.com/felixge/fgprof"
 	"github.com/gorilla/mux"
 	"github.com/minio/madmin-go"
 	miniogopolicy "github.com/minio/minio-go/v7/pkg/policy"
+	"github.com/minio/minio/internal/config"
+	"github.com/minio/minio/internal/config/api"
+	xtls "github.com/minio/minio/internal/config/identity/tls"
+	"github.com/minio/minio/internal/fips"
 	"github.com/minio/minio/internal/handlers"
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/minio/internal/logger/message/audit"
 	"github.com/minio/minio/internal/rest"
 	"github.com/minio/pkg/certs"
+	"github.com/minio/pkg/env"
+	"golang.org/x/oauth2"
 )
 
 const (
@@ -104,10 +113,6 @@ func path2BucketObject(s string) (bucket, prefix string) {
 	return path2BucketObjectWithBasePath("", s)
 }
 
-func getReadQuorum(drive int) int {
-	return drive - getDefaultParityBlocks(drive)
-}
-
 func getWriteQuorum(drive int) int {
 	parity := getDefaultParityBlocks(drive)
 	quorum := drive - parity
@@ -159,7 +164,7 @@ func hasContentMD5(h http.Header) bool {
 	return ok
 }
 
-/// http://docs.aws.amazon.com/AmazonS3/latest/dev/UploadingObjects.html
+// http://docs.aws.amazon.com/AmazonS3/latest/dev/UploadingObjects.html
 const (
 	// Maximum object size per PUT request is 5TB.
 	// This is a divergence from S3 limit on purpose to support
@@ -315,6 +320,41 @@ func startProfiler(profilerType string) (minioProfiler, error) {
 			defer os.RemoveAll(dirPath)
 			return ioutil.ReadFile(fn)
 		}
+		// TODO(klauspost): Replace with madmin.ProfilerCPUIO on next update.
+	case "cpuio":
+		// at 10k or more goroutines fgprof is likely to become
+		// unable to maintain its sampling rate and to significantly
+		// degrade the performance of your application
+		// https://github.com/felixge/fgprof#fgprof
+		if n := runtime.NumGoroutine(); n > 10000 && !globalIsCICD {
+			return nil, fmt.Errorf("unable to perform CPU IO profile with %d goroutines", n)
+		}
+		dirPath, err := ioutil.TempDir("", "profile")
+		if err != nil {
+			return nil, err
+		}
+		fn := filepath.Join(dirPath, "cpuio.out")
+		f, err := os.Create(fn)
+		if err != nil {
+			return nil, err
+		}
+		stop := fgprof.Start(f, fgprof.FormatPprof)
+		err = pprof.StartCPUProfile(f)
+		if err != nil {
+			return nil, err
+		}
+		prof.stopFn = func() ([]byte, error) {
+			err := stop()
+			if err != nil {
+				return nil, err
+			}
+			err = f.Close()
+			if err != nil {
+				return nil, err
+			}
+			defer os.RemoveAll(dirPath)
+			return ioutil.ReadFile(fn)
+		}
 	case madmin.ProfilerMEM:
 		runtime.GC()
 		prof.record("heap", 0, "before")
@@ -399,8 +439,10 @@ type minioProfiler interface {
 }
 
 // Global profiler to be used by service go-routine.
-var globalProfiler map[string]minioProfiler
-var globalProfilerMu sync.Mutex
+var (
+	globalProfiler   map[string]minioProfiler
+	globalProfilerMu sync.Mutex
+)
 
 // dump the request into a string in JSON format.
 func dumpRequest(r *http.Request) string {
@@ -408,7 +450,7 @@ func dumpRequest(r *http.Request) string {
 	header.Set("Host", r.Host)
 	// Replace all '%' to '%%' so that printer format parser
 	// to ignore URL encoded values.
-	rawURI := strings.Replace(r.RequestURI, "%", "%%", -1)
+	rawURI := strings.ReplaceAll(r.RequestURI, "%", "%%")
 	req := struct {
 		Method     string      `json:"method"`
 		RequestURI string      `json:"reqURI"`
@@ -591,6 +633,8 @@ func NewGatewayHTTPTransportWithClientCerts(clientCert, clientKey string) *http.
 				err.Error()))
 		}
 		if c != nil {
+			c.UpdateReloadDuration(10 * time.Second)
+			c.ReloadOnSignal(syscall.SIGHUP) // allow reloads upon SIGHUP
 			transport.TLSClientConfig.GetClientCertificate = c.GetClientCertificate
 		}
 	}
@@ -605,7 +649,8 @@ func NewGatewayHTTPTransport() *http.Transport {
 
 func newGatewayHTTPTransport(timeout time.Duration) *http.Transport {
 	tr := newCustomHTTPTransport(&tls.Config{
-		RootCAs: globalRootCAs,
+		RootCAs:            globalRootCAs,
+		ClientSessionCache: tls.NewLRUClientSessionCache(tlsClientSessionCacheSize),
 	}, defaultDialTimeout)()
 
 	// Customize response header timeout for gateway transport.
@@ -631,7 +676,8 @@ func NewRemoteTargetHTTPTransport() *http.Transport {
 		TLSHandshakeTimeout:   5 * time.Second,
 		ExpectContinueTimeout: 5 * time.Second,
 		TLSClientConfig: &tls.Config{
-			RootCAs: globalRootCAs,
+			RootCAs:            globalRootCAs,
+			ClientSessionCache: tls.NewLRUClientSessionCache(tlsClientSessionCacheSize),
 		},
 		// Go net/http automatically unzip if content-type is
 		// gzip disable this feature, as we are always interested
@@ -744,6 +790,21 @@ func likelyUnescapeGeneric(p string, escapeFn func(string) (string, error)) stri
 	return ep
 }
 
+func updateReqContext(ctx context.Context, objects ...ObjectV) context.Context {
+	req := logger.GetReqInfo(ctx)
+	if req != nil {
+		req.Objects = make([]logger.ObjectVersion, 0, len(objects))
+		for _, ov := range objects {
+			req.Objects = append(req.Objects, logger.ObjectVersion{
+				ObjectName: ov.ObjectName,
+				VersionID:  ov.VersionID,
+			})
+		}
+		return logger.SetReqInfo(ctx, req)
+	}
+	return ctx
+}
+
 // Returns context with ReqInfo details set in the context.
 func newContext(r *http.Request, w http.ResponseWriter, api string) context.Context {
 	vars := mux.Vars(r)
@@ -762,6 +823,7 @@ func newContext(r *http.Request, w http.ResponseWriter, api string) context.Cont
 		API:          api,
 		BucketName:   bucket,
 		ObjectName:   object,
+		VersionID:    strings.TrimSpace(r.Form.Get(xhttp.VersionID)),
 	}
 	return logger.SetReqInfo(r.Context(), reqInfo)
 }
@@ -969,4 +1031,175 @@ func auditLogInternal(ctx context.Context, bucket, object string, opts AuditLogO
 	entry.API.Status = opts.Status
 	ctx = logger.SetAuditEntry(ctx, &entry)
 	logger.AuditLog(ctx, nil, nil, nil)
+}
+
+func newTLSConfig(getCert certs.GetCertificateFunc) *tls.Config {
+	if getCert == nil {
+		return nil
+	}
+
+	tlsConfig := &tls.Config{
+		PreferServerCipherSuites: true,
+		MinVersion:               tls.VersionTLS12,
+		NextProtos:               []string{"http/1.1", "h2"},
+		GetCertificate:           getCert,
+		ClientSessionCache:       tls.NewLRUClientSessionCache(tlsClientSessionCacheSize),
+	}
+
+	tlsClientIdentity := env.Get(xtls.EnvIdentityTLSEnabled, "") == config.EnableOn
+	if tlsClientIdentity {
+		tlsConfig.ClientAuth = tls.RequestClientCert
+	}
+
+	secureCiphers := env.Get(api.EnvAPISecureCiphers, config.EnableOn) == config.EnableOn
+	if secureCiphers || fips.Enabled {
+		// Hardened ciphers
+		tlsConfig.CipherSuites = fips.CipherSuitesTLS()
+		tlsConfig.CurvePreferences = fips.EllipticCurvesTLS()
+	} else {
+		// Default ciphers while excluding those with security issues
+		for _, cipher := range tls.CipherSuites() {
+			tlsConfig.CipherSuites = append(tlsConfig.CipherSuites, cipher.ID)
+		}
+	}
+	return tlsConfig
+}
+
+/////////// Types and functions for OpenID IAM testing
+
+// OpenIDClientAppParams - contains openID client application params, used in
+// testing.
+type OpenIDClientAppParams struct {
+	ClientID, ClientSecret, ProviderURL, RedirectURL string
+}
+
+// MockOpenIDTestUserInteraction - tries to login to dex using provided credentials.
+// It performs the user's browser interaction to login and retrieves the auth
+// code from dex and exchanges it for a JWT.
+func MockOpenIDTestUserInteraction(ctx context.Context, pro OpenIDClientAppParams, username, password string) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	provider, err := oidc.NewProvider(ctx, pro.ProviderURL)
+	if err != nil {
+		return "", fmt.Errorf("unable to create provider: %v", err)
+	}
+
+	// Configure an OpenID Connect aware OAuth2 client.
+	oauth2Config := oauth2.Config{
+		ClientID:     pro.ClientID,
+		ClientSecret: pro.ClientSecret,
+		RedirectURL:  pro.RedirectURL,
+
+		// Discovery returns the OAuth2 endpoints.
+		Endpoint: provider.Endpoint(),
+
+		// "openid" is a required scope for OpenID Connect flows.
+		Scopes: []string{oidc.ScopeOpenID, "groups"},
+	}
+
+	state := fmt.Sprintf("x%dx", time.Now().Unix())
+	authCodeURL := oauth2Config.AuthCodeURL(state)
+	// fmt.Printf("authcodeurl: %s\n", authCodeURL)
+
+	var lastReq *http.Request
+	checkRedirect := func(req *http.Request, via []*http.Request) error {
+		// fmt.Printf("CheckRedirect:\n")
+		// fmt.Printf("Upcoming: %s %s\n", req.Method, req.URL.String())
+		// for i, c := range via {
+		// 	fmt.Printf("Sofar %d: %s %s\n", i, c.Method, c.URL.String())
+		// }
+		// Save the last request in a redirect chain.
+		lastReq = req
+		// We do not follow redirect back to client application.
+		if req.URL.Path == "/oauth_callback" {
+			return http.ErrUseLastResponse
+		}
+		return nil
+	}
+
+	dexClient := http.Client{
+		CheckRedirect: checkRedirect,
+	}
+
+	u, err := url.Parse(authCodeURL)
+	if err != nil {
+		return "", fmt.Errorf("url parse err: %v", err)
+	}
+
+	// Start the user auth flow. This page would present the login with
+	// email or LDAP option.
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return "", fmt.Errorf("new request err: %v", err)
+	}
+	_, err = dexClient.Do(req)
+	// fmt.Printf("Do: %#v %#v\n", resp, err)
+	if err != nil {
+		return "", fmt.Errorf("auth url request err: %v", err)
+	}
+
+	// Modify u to choose the ldap option
+	u.Path += "/ldap"
+	// fmt.Println(u)
+
+	// Pick the LDAP login option. This would return a form page after
+	// following some redirects. `lastReq` would be the URL of the form
+	// page, where we need to POST (submit) the form.
+	req, err = http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return "", fmt.Errorf("new request err (/ldap): %v", err)
+	}
+	_, err = dexClient.Do(req)
+	// fmt.Printf("Fetch LDAP login page: %#v %#v\n", resp, err)
+	if err != nil {
+		return "", fmt.Errorf("request err: %v", err)
+	}
+	// {
+	// 	bodyBuf, err := ioutil.ReadAll(resp.Body)
+	// 	if err != nil {
+	// 		return "", fmt.Errorf("Error reading body: %v", err)
+	// 	}
+	// 	fmt.Printf("bodyBuf (for LDAP login page): %s\n", string(bodyBuf))
+	// }
+
+	// Fill the login form with our test creds:
+	// fmt.Printf("login form url: %s\n", lastReq.URL.String())
+	formData := url.Values{}
+	formData.Set("login", username)
+	formData.Set("password", password)
+	req, err = http.NewRequestWithContext(ctx, http.MethodPost, lastReq.URL.String(), strings.NewReader(formData.Encode()))
+	if err != nil {
+		return "", fmt.Errorf("new request err (/login): %v", err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	_, err = dexClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("post form err: %v", err)
+	}
+	// fmt.Printf("resp: %#v %#v\n", resp.StatusCode, resp.Header)
+	// bodyBuf, err := ioutil.ReadAll(resp.Body)
+	// if err != nil {
+	// 	return "", fmt.Errorf("Error reading body: %v", err)
+	// }
+	// fmt.Printf("resp body: %s\n", string(bodyBuf))
+	// fmt.Printf("lastReq: %#v\n", lastReq.URL.String())
+
+	// On form submission, the last redirect response contains the auth
+	// code, which we now have in `lastReq`. Exchange it for a JWT id_token.
+	q := lastReq.URL.Query()
+	// fmt.Printf("lastReq.URL: %#v q: %#v\n", lastReq.URL, q)
+	code := q.Get("code")
+	oauth2Token, err := oauth2Config.Exchange(ctx, code)
+	if err != nil {
+		return "", fmt.Errorf("unable to exchange code for id token: %v", err)
+	}
+
+	rawIDToken, ok := oauth2Token.Extra("id_token").(string)
+	if !ok {
+		return "", fmt.Errorf("id_token not found!")
+	}
+
+	// fmt.Printf("TOKEN: %s\n", rawIDToken)
+	return rawIDToken, nil
 }

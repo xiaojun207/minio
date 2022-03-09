@@ -1,23 +1,26 @@
-name: Go
+name: Crosscompile
 
 on:
   pull_request:
     branches:
     - master
 
+# This ensures that previous jobs for the PR are canceled when the PR is
+# updated.
+concurrency: 
+  group: ${{ github.workflow }}-${{ github.head_ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
-    name: MinIO crosscompile tests on ${{ matrix.go-version }} and ${{ matrix.os }}
+    name: Build Tests with Go ${{ matrix.go-version }} on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        go-version: [1.16.x]
+        go-version: [1.17.x]
         os: [ubuntu-latest]
     steps:
       - uses: actions/checkout@v2
-      - uses: actions/setup-node@v1
-        with:
-          node-version: '12'
       - uses: actions/setup-go@v2
         with:
           go-version: ${{ matrix.go-version }}

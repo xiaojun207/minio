@@ -18,12 +18,15 @@
 package cmd
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/gob"
 	"errors"
 	"fmt"
+	"io/ioutil"
 	"math/rand"
 	"net"
 	"net/http"
@@ -34,16 +37,20 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
+	"github.com/dustin/go-humanize"
 	fcolor "github.com/fatih/color"
 	"github.com/go-openapi/loads"
+	"github.com/inconshreveable/mousetrap"
 	dns2 "github.com/miekg/dns"
 	"github.com/minio/cli"
 	consoleCerts "github.com/minio/console/pkg/certs"
 	"github.com/minio/console/restapi"
 	"github.com/minio/console/restapi/operations"
 	"github.com/minio/kes"
+	"github.com/minio/madmin-go"
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/minio/minio-go/v7/pkg/set"
@@ -51,7 +58,6 @@ import (
 	"github.com/minio/minio/internal/color"
 	"github.com/minio/minio/internal/config"
 	"github.com/minio/minio/internal/handlers"
-	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/kms"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/pkg/certs"
@@ -59,28 +65,61 @@ import (
 	"github.com/minio/pkg/ellipses"
 	"github.com/minio/pkg/env"
 	xnet "github.com/minio/pkg/net"
+	"github.com/rs/dnscache"
 )
 
 // serverDebugLog will enable debug printing
 var serverDebugLog = env.Get("_MINIO_SERVER_DEBUG", config.EnableOff) == config.EnableOn
-var defaultAWSCredProvider []credentials.Provider
+
+var (
+	shardDiskTimeDelta     time.Duration
+	defaultAWSCredProvider []credentials.Provider
+)
 
 func init() {
+	if runtime.GOOS == "windows" {
+		if mousetrap.StartedByExplorer() {
+			fmt.Printf("Don't double-click %s\n", os.Args[0])
+			fmt.Println("You need to open cmd.exe/PowerShell and run it from the command line")
+			fmt.Println("Refer to the docs here on how to run it as a Windows Service https://github.com/minio/minio-service/tree/master/windows")
+			fmt.Println("Press the Enter Key to Exit")
+			fmt.Scanln()
+			os.Exit(1)
+		}
+	}
+
 	rand.Seed(time.Now().UTC().UnixNano())
 
 	logger.Init(GOPATH, GOROOT)
 	logger.RegisterError(config.FmtError)
 
-	if IsKubernetes() || IsDocker() || IsBOSH() || IsDCOS() || IsPCFTile() {
-		// 30 seconds matches the orchestrator DNS TTLs, have
-		// a 5 second timeout to lookup from DNS servers.
-		globalDNSCache = xhttp.NewDNSCache(30*time.Second, 5*time.Second, logger.LogOnceIf)
-	} else {
-		// On bare-metals DNS do not change often, so it is
-		// safe to assume a higher timeout upto 10 minutes.
-		globalDNSCache = xhttp.NewDNSCache(10*time.Minute, 5*time.Second, logger.LogOnceIf)
-	}
 	initGlobalContext()
+
+	options := dnscache.ResolverRefreshOptions{
+		ClearUnused:      true,
+		PersistOnFailure: false,
+	}
+
+	// Call to refresh will refresh names in cache. If you pass true, it will also
+	// remove cached names not looked up since the last call to Refresh. It is a good idea
+	// to call this method on a regular interval.
+	go func() {
+		var t *time.Ticker
+		if IsKubernetes() || IsDocker() || IsBOSH() || IsDCOS() || IsPCFTile() {
+			t = time.NewTicker(1 * time.Minute)
+		} else {
+			t = time.NewTicker(10 * time.Minute)
+		}
+		defer t.Stop()
+		for {
+			select {
+			case <-t.C:
+				globalDNSCache.RefreshWithOptions(options)
+			case <-GlobalContext.Done():
+				return
+			}
+		}
+	}()
 
 	globalForwarder = handlers.NewForwarder(&handlers.Forwarder{
 		PassHost:     true,
@@ -95,6 +134,8 @@ func init() {
 	console.SetColor("Debug", fcolor.New())
 
 	gob.Register(StorageErr(""))
+	gob.Register(madmin.TimeInfo{})
+	gob.Register(map[string]interface{}{})
 
 	defaultAWSCredProvider = []credentials.Provider{
 		&credentials.IAM{
@@ -102,6 +143,12 @@ func init() {
 				Transport: NewGatewayHTTPTransport(),
 			},
 		},
+	}
+
+	var err error
+	shardDiskTimeDelta, err = time.ParseDuration(env.Get("_MINIO_SHARD_DISKTIME_DELTA", "1m"))
+	if err != nil {
+		shardDiskTimeDelta = 1 * time.Minute
 	}
 
 	// All minio-go API operations shall be performed only once,
@@ -138,20 +185,37 @@ func minioConfigToConsoleFeatures() {
 	}
 	// if IDP is enabled, set IDP environment variables
 	if globalOpenIDConfig.URL != nil {
-		os.Setenv("CONSOLE_IDP_URL", globalOpenIDConfig.DiscoveryDoc.Issuer)
+		os.Setenv("CONSOLE_IDP_URL", globalOpenIDConfig.URL.String())
 		os.Setenv("CONSOLE_IDP_CLIENT_ID", globalOpenIDConfig.ClientID)
 		os.Setenv("CONSOLE_IDP_SECRET", globalOpenIDConfig.ClientSecret)
 		os.Setenv("CONSOLE_IDP_HMAC_SALT", globalDeploymentID)
 		os.Setenv("CONSOLE_IDP_HMAC_PASSPHRASE", globalOpenIDConfig.ClientID)
 		os.Setenv("CONSOLE_IDP_SCOPES", strings.Join(globalOpenIDConfig.DiscoveryDoc.ScopesSupported, ","))
+		if globalOpenIDConfig.ClaimUserinfo {
+			os.Setenv("CONSOLE_IDP_USERINFO", config.EnableOn)
+		}
+		if globalOpenIDConfig.RedirectURIDynamic {
+			// Enable dynamic redirect-uri's based on incoming 'host' header,
+			// Overrides any other callback URL.
+			os.Setenv("CONSOLE_IDP_CALLBACK_DYNAMIC", config.EnableOn)
+		}
 		if globalOpenIDConfig.RedirectURI != "" {
 			os.Setenv("CONSOLE_IDP_CALLBACK", globalOpenIDConfig.RedirectURI)
 		} else {
 			os.Setenv("CONSOLE_IDP_CALLBACK", getConsoleEndpoints()[0]+"/oauth_callback")
 		}
 	}
-	os.Setenv("CONSOLE_MINIO_REGION", globalServerRegion)
+	os.Setenv("CONSOLE_MINIO_REGION", globalSite.Region)
 	os.Setenv("CONSOLE_CERT_PASSWD", env.Get("MINIO_CERT_PASSWD", ""))
+	if globalSubnetConfig.License != "" {
+		os.Setenv("CONSOLE_SUBNET_LICENSE", globalSubnetConfig.License)
+	}
+	if globalSubnetConfig.APIKey != "" {
+		os.Setenv("CONSOLE_SUBNET_API_KEY", globalSubnetConfig.APIKey)
+	}
+	if globalSubnetConfig.Proxy != "" {
+		os.Setenv("CONSOLE_SUBNET_PROXY", globalSubnetConfig.Proxy)
+	}
 }
 
 func initConsoleServer() (*restapi.Server, error) {
@@ -176,16 +240,16 @@ func initConsoleServer() (*restapi.Server, error) {
 		return nil, err
 	}
 
-	noLog := func(string, ...interface{}) {
-		// nothing to log
-	}
-
-	// Initialize MinIO loggers
-	restapi.LogInfo = noLog
-	restapi.LogError = noLog
-
 	api := operations.NewConsoleAPI(swaggerSpec)
-	api.Logger = noLog
+
+	if !serverDebugLog {
+		// Disable console logging if server debug log is not enabled
+		noLog := func(string, ...interface{}) {}
+
+		restapi.LogInfo = noLog
+		restapi.LogError = noLog
+		api.Logger = noLog
+	}
 
 	server := restapi.NewServer(api)
 	// register all APIs
@@ -263,7 +327,7 @@ func checkUpdate(mode string) {
 		return
 	}
 
-	logStartupMessage(prepareUpdateMessage("Run `mc admin update`", lrTime.Sub(crTime)))
+	logger.Info(prepareUpdateMessage("Run `mc admin update`", lrTime.Sub(crTime)))
 }
 
 func newConfigDirFromCtx(ctx *cli.Context, option string, getDefaultDir func() string) (*ConfigDir, bool) {
@@ -308,7 +372,6 @@ func newConfigDirFromCtx(ctx *cli.Context, option string, getDefaultDir func() s
 }
 
 func handleCommonCmdArgs(ctx *cli.Context) {
-
 	// Get "json" flag from command line argument and
 	// enable json and quite modes if json flag is turned on.
 	globalCLIContext.JSON = ctx.IsSet("json") || ctx.GlobalIsSet("json")
@@ -389,7 +452,166 @@ func handleCommonCmdArgs(ctx *cli.Context) {
 	logger.FatalIf(mkdirAllIgnorePerm(globalCertsCADir.Get()), "Unable to create certs CA directory at %s", globalCertsCADir.Get())
 }
 
+type envKV struct {
+	Key   string
+	Value string
+	Skip  bool
+}
+
+func (e envKV) String() string {
+	if e.Skip {
+		return ""
+	}
+	return fmt.Sprintf("%s=%s", e.Key, e.Value)
+}
+
+func parsEnvEntry(envEntry string) (envKV, error) {
+	envEntry = strings.TrimSpace(envEntry)
+	if envEntry == "" {
+		// Skip all empty lines
+		return envKV{
+			Skip: true,
+		}, nil
+	}
+	const envSeparator = "="
+	envTokens := strings.SplitN(strings.TrimSpace(strings.TrimPrefix(envEntry, "export")), envSeparator, 2)
+	if len(envTokens) != 2 {
+		return envKV{}, fmt.Errorf("envEntry malformed; %s, expected to be of form 'KEY=value'", envEntry)
+	}
+
+	key := envTokens[0]
+	val := envTokens[1]
+
+	// Remove quotes from the value if found
+	if len(val) >= 2 {
+		quote := val[0]
+		if (quote == '"' || quote == '\'') && val[len(val)-1] == quote {
+			val = val[1 : len(val)-1]
+		}
+	}
+
+	return envKV{
+		Key:   key,
+		Value: val,
+	}, nil
+}
+
+// Similar to os.Environ returns a copy of strings representing
+// the environment values from a file, in the form "key, value".
+// in a structured form.
+func minioEnvironFromFile(envConfigFile string) ([]envKV, error) {
+	f, err := os.Open(envConfigFile)
+	if err != nil {
+		if os.IsNotExist(err) { // ignore if file doesn't exist.
+			return nil, nil
+		}
+		return nil, err
+	}
+	defer f.Close()
+	var ekvs []envKV
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		ekv, err := parsEnvEntry(scanner.Text())
+		if err != nil {
+			return nil, err
+		}
+		if ekv.Skip {
+			// Skips empty lines
+			continue
+		}
+		ekvs = append(ekvs, ekv)
+	}
+	if err = scanner.Err(); err != nil {
+		return nil, err
+	}
+	return ekvs, nil
+}
+
+func readFromSecret(sp string) (string, error) {
+	// Supports reading path from docker secrets, filename is
+	// relative to /run/secrets/ position.
+	if isFile(pathJoin("/run/secrets/", sp)) {
+		sp = pathJoin("/run/secrets/", sp)
+	}
+	credBuf, err := ioutil.ReadFile(sp)
+	if err != nil {
+		if os.IsNotExist(err) { // ignore if file doesn't exist.
+			return "", nil
+		}
+		return "", err
+	}
+	return string(bytes.TrimSpace(credBuf)), nil
+}
+
+func loadEnvVarsFromFiles() {
+	if env.IsSet(config.EnvAccessKeyFile) {
+		accessKey, err := readFromSecret(env.Get(config.EnvAccessKeyFile, ""))
+		if err != nil {
+			logger.Fatal(config.ErrInvalidCredentials(err),
+				"Unable to validate credentials inherited from the secret file(s)")
+		}
+		if accessKey != "" {
+			os.Setenv(config.EnvRootUser, accessKey)
+		}
+	}
+
+	if env.IsSet(config.EnvSecretKeyFile) {
+		secretKey, err := readFromSecret(env.Get(config.EnvSecretKeyFile, ""))
+		if err != nil {
+			logger.Fatal(config.ErrInvalidCredentials(err),
+				"Unable to validate credentials inherited from the secret file(s)")
+		}
+		if secretKey != "" {
+			os.Setenv(config.EnvRootPassword, secretKey)
+		}
+	}
+
+	if env.IsSet(config.EnvRootUserFile) {
+		rootUser, err := readFromSecret(env.Get(config.EnvRootUserFile, ""))
+		if err != nil {
+			logger.Fatal(config.ErrInvalidCredentials(err),
+				"Unable to validate credentials inherited from the secret file(s)")
+		}
+		if rootUser != "" {
+			os.Setenv(config.EnvRootUser, rootUser)
+		}
+	}
+
+	if env.IsSet(config.EnvRootPasswordFile) {
+		rootPassword, err := readFromSecret(env.Get(config.EnvRootPasswordFile, ""))
+		if err != nil {
+			logger.Fatal(config.ErrInvalidCredentials(err),
+				"Unable to validate credentials inherited from the secret file(s)")
+		}
+		if rootPassword != "" {
+			os.Setenv(config.EnvRootPassword, rootPassword)
+		}
+	}
+
+	if env.IsSet(config.EnvKMSSecretKeyFile) {
+		kmsSecret, err := readFromSecret(env.Get(config.EnvKMSSecretKeyFile, ""))
+		if err != nil {
+			logger.Fatal(err, "Unable to read the KMS secret key inherited from secret file")
+		}
+		if kmsSecret != "" {
+			os.Setenv(config.EnvKMSSecretKey, kmsSecret)
+		}
+	}
+
+	if env.IsSet(config.EnvConfigEnvFile) {
+		ekvs, err := minioEnvironFromFile(env.Get(config.EnvConfigEnvFile, ""))
+		if err != nil {
+			logger.Fatal(err, "Unable to read the config environment file")
+		}
+		for _, ekv := range ekvs {
+			os.Setenv(ekv.Key, ekv.Value)
+		}
+	}
+}
+
 func handleCommonEnvVars() {
+	loadEnvVarsFromFiles()
+
 	var err error
 	globalBrowserEnabled, err = config.ParseBool(env.Get(config.EnvBrowser, config.EnableOn))
 	if err != nil {
@@ -434,6 +656,16 @@ func handleCommonEnvVars() {
 		logger.Fatal(config.ErrInvalidFSOSyncValue(err), "Invalid MINIO_FS_OSYNC value in environment variable")
 	}
 
+	if rootDiskSize := env.Get(config.EnvRootDiskThresholdSize, ""); rootDiskSize != "" {
+		size, err := humanize.ParseBytes(rootDiskSize)
+		if err != nil {
+			logger.Fatal(err, fmt.Sprintf("Invalid %s value in environment variable", config.EnvRootDiskThresholdSize))
+		}
+		globalRootDiskThreshold = size
+	}
+
+	globalIsCICD = env.Get("MINIO_CI_CD", "") != "" || env.Get("CI", "") != ""
+
 	domains := env.Get(config.EnvDomain, "")
 	if len(domains) != 0 {
 		for _, domainName := range strings.Split(domains, config.ValueSeparator) {
@@ -456,11 +688,11 @@ func handleCommonEnvVars() {
 	publicIPs := env.Get(config.EnvPublicIPs, "")
 	if len(publicIPs) != 0 {
 		minioEndpoints := strings.Split(publicIPs, config.ValueSeparator)
-		var domainIPs = set.NewStringSet()
+		domainIPs := set.NewStringSet()
 		for _, endpoint := range minioEndpoints {
 			if net.ParseIP(endpoint) == nil {
 				// Checking if the IP is a DNS entry.
-				addrs, err := net.LookupHost(endpoint)
+				addrs, err := globalDNSCache.LookupHost(GlobalContext, endpoint)
 				if err != nil {
 					logger.FatalIf(err, "Unable to initialize MinIO server with [%s] invalid entry found in MINIO_PUBLIC_IPS", endpoint)
 				}
@@ -486,11 +718,12 @@ func handleCommonEnvVars() {
 	// in-place update is off.
 	globalInplaceUpdateDisabled = strings.EqualFold(env.Get(config.EnvUpdate, config.EnableOn), config.EnableOff)
 
-	// Check if the supported credential env vars, "MINIO_ROOT_USER" and
-	// "MINIO_ROOT_PASSWORD" are provided
+	// Check if the supported credential env vars,
+	// "MINIO_ROOT_USER" and "MINIO_ROOT_PASSWORD" are provided
 	// Warn user if deprecated environment variables,
 	// "MINIO_ACCESS_KEY" and "MINIO_SECRET_KEY", are defined
 	// Check all error conditions first
+	//nolint:gocritic
 	if !env.IsSet(config.EnvRootUser) && env.IsSet(config.EnvRootPassword) {
 		logger.Fatal(config.ErrMissingEnvCredentialRootUser(nil), "Unable to start MinIO")
 	} else if env.IsSet(config.EnvRootUser) && !env.IsSet(config.EnvRootPassword) {
@@ -507,29 +740,29 @@ func handleCommonEnvVars() {
 	// are defined or both are not defined.
 	// Check both cases and authenticate them if correctly defined
 	var user, password string
-	haveRootCredentials := false
-	haveAccessCredentials := false
+	var hasCredentials bool
+	//nolint:gocritic
 	if env.IsSet(config.EnvRootUser) && env.IsSet(config.EnvRootPassword) {
 		user = env.Get(config.EnvRootUser, "")
 		password = env.Get(config.EnvRootPassword, "")
-		haveRootCredentials = true
+		hasCredentials = true
 	} else if env.IsSet(config.EnvAccessKey) && env.IsSet(config.EnvSecretKey) {
 		user = env.Get(config.EnvAccessKey, "")
 		password = env.Get(config.EnvSecretKey, "")
-		haveAccessCredentials = true
+		hasCredentials = true
 	}
-	if haveRootCredentials || haveAccessCredentials {
+	if hasCredentials {
 		cred, err := auth.CreateCredentials(user, password)
 		if err != nil {
 			logger.Fatal(config.ErrInvalidCredentials(err),
 				"Unable to validate credentials inherited from the shell environment")
 		}
-		if haveAccessCredentials {
+		if env.IsSet(config.EnvAccessKey) && env.IsSet(config.EnvSecretKey) {
 			msg := fmt.Sprintf("WARNING: %s and %s are deprecated.\n"+
 				"         Please use %s and %s",
 				config.EnvAccessKey, config.EnvSecretKey,
 				config.EnvRootUser, config.EnvRootPassword)
-			logStartupMessage(color.RedBold(msg))
+			logger.Info(color.RedBold(msg))
 		}
 		globalActiveCred = cred
 	}
@@ -572,7 +805,7 @@ func handleCommonEnvVars() {
 			logger.Fatal(err, fmt.Sprintf("Unable to load X.509 root CAs for KES from %q", env.Get(config.EnvKESServerCA, globalCertsCADir.Get())))
 		}
 
-		var defaultKeyID = env.Get(config.EnvKESKeyName, "")
+		defaultKeyID := env.Get(config.EnvKESKeyName, "")
 		KMS, err := kms.NewWithConfig(kms.Config{
 			Endpoints:    endpoints,
 			DefaultKeyID: defaultKeyID,
@@ -592,17 +825,6 @@ func handleCommonEnvVars() {
 		}
 		GlobalKMS = KMS
 	}
-
-	if tiers := env.Get("_MINIO_DEBUG_REMOTE_TIERS_IMMEDIATELY", ""); tiers != "" {
-		globalDebugRemoteTiersImmediately = strings.Split(tiers, ",")
-	}
-}
-
-func logStartupMessage(msg string) {
-	if globalConsoleSys != nil {
-		globalConsoleSys.Send(msg, string(logger.All))
-	}
-	logger.StartupMessage(msg)
 }
 
 func getTLSConfig() (x509Certs []*x509.Certificate, manager *certs.Manager, secureConn bool, err error) {
@@ -680,6 +902,13 @@ func getTLSConfig() (x509Certs []*x509.Certificate, manager *certs.Manager, secu
 		}
 	}
 	secureConn = true
+
+	// Certs might be symlinks, reload them every 10 seconds.
+	manager.UpdateReloadDuration(10 * time.Second)
+
+	// syscall.SIGHUP to reload the certs.
+	manager.ReloadOnSignal(syscall.SIGHUP)
+
 	return x509Certs, manager, secureConn, nil
 }
 
@@ -691,4 +920,33 @@ func contextCanceled(ctx context.Context) bool {
 	default:
 		return false
 	}
+}
+
+// bgContext returns a context that can be used for async operations.
+// Cancellation/timeouts are removed, so parent cancellations/timeout will
+// not propagate from parent.
+// Context values are preserved.
+// This can be used for goroutines that live beyond the parent context.
+func bgContext(parent context.Context) context.Context {
+	return bgCtx{parent: parent}
+}
+
+type bgCtx struct {
+	parent context.Context
+}
+
+func (a bgCtx) Done() <-chan struct{} {
+	return nil
+}
+
+func (a bgCtx) Err() error {
+	return nil
+}
+
+func (a bgCtx) Deadline() (deadline time.Time, ok bool) {
+	return time.Time{}, false
+}
+
+func (a bgCtx) Value(key interface{}) interface{} {
+	return a.parent.Value(key)
 }

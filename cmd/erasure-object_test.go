@@ -128,6 +128,86 @@ func TestErasureDeleteObjectBasic(t *testing.T) {
 	removeRoots(fsDirs)
 }
 
+func TestDeleteObjectsVersioned(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	obj, fsDirs, err := prepareErasure(ctx, 16)
+	if err != nil {
+		t.Fatal("Unable to initialize 'Erasure' object layer.", err)
+	}
+	// Remove all dirs.
+	for _, dir := range fsDirs {
+		defer os.RemoveAll(dir)
+	}
+
+	type testCaseType struct {
+		bucket string
+		object string
+	}
+
+	bucketName := "bucket"
+	testCases := []testCaseType{
+		{bucketName, "dir/obj1"},
+		{bucketName, "dir/obj1"},
+	}
+
+	err = obj.MakeBucketWithLocation(ctx, bucketName, BucketOptions{
+		VersioningEnabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	names := make([]ObjectToDelete, len(testCases))
+	for i, testCase := range testCases {
+		objInfo, err := obj.PutObject(ctx, testCase.bucket, testCase.object,
+			mustGetPutObjReader(t, bytes.NewReader([]byte("abcd")), int64(len("abcd")), "", ""), ObjectOptions{
+				Versioned: true,
+			})
+		if err != nil {
+			t.Fatalf("Erasure Object upload failed: <ERROR> %s", err)
+		}
+		names[i] = ObjectToDelete{
+			ObjectV: ObjectV{
+				ObjectName: objInfo.Name,
+				VersionID:  objInfo.VersionID,
+			},
+		}
+
+	}
+	names = append(names, ObjectToDelete{
+		ObjectV: ObjectV{
+			ObjectName: "dir/obj1",
+			VersionID:  mustGetUUID(), // add a non-existent UUID.
+		},
+	})
+
+	_, delErrs := obj.DeleteObjects(ctx, bucketName, names, ObjectOptions{
+		Versioned: true,
+	})
+	for i := range delErrs {
+		if delErrs[i] != nil {
+			t.Errorf("Failed to remove object `%v` with the error: `%v`", names[i], delErrs[i])
+		}
+	}
+
+	for i, test := range testCases {
+		_, statErr := obj.GetObjectInfo(ctx, test.bucket, test.object, ObjectOptions{
+			VersionID: names[i].ObjectV.VersionID,
+		})
+		switch statErr.(type) {
+		case VersionNotFound:
+		default:
+			t.Fatalf("Object %s is not removed", test.bucket+SlashSeparator+test.object)
+		}
+	}
+
+	if _, err = ioutil.ReadFile(pathJoin(fsDirs[0], bucketName, "dir/obj1", "xl.meta")); err == nil {
+		t.Fatalf("xl.meta still present after removal")
+	}
+}
+
 func TestErasureDeleteObjectsErasureSet(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -177,7 +257,11 @@ func TestErasureDeleteObjectsErasureSet(t *testing.T) {
 	toObjectNames := func(testCases []testCaseType) []ObjectToDelete {
 		names := make([]ObjectToDelete, len(testCases))
 		for i := range testCases {
-			names[i] = ObjectToDelete{ObjectName: testCases[i].object}
+			names[i] = ObjectToDelete{
+				ObjectV: ObjectV{
+					ObjectName: testCases[i].object,
+				},
+			}
 		}
 		return names
 	}
@@ -202,13 +286,6 @@ func TestErasureDeleteObjectsErasureSet(t *testing.T) {
 }
 
 func TestErasureDeleteObjectDiskNotFound(t *testing.T) {
-	restoreGlobalStorageClass := globalStorageClass
-	defer func() {
-		globalStorageClass = restoreGlobalStorageClass
-	}()
-
-	globalStorageClass = storageclass.Config{}
-
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -278,13 +355,6 @@ func TestErasureDeleteObjectDiskNotFound(t *testing.T) {
 }
 
 func TestErasureDeleteObjectDiskNotFoundErasure4(t *testing.T) {
-	restoreGlobalStorageClass := globalStorageClass
-	defer func() {
-		globalStorageClass = restoreGlobalStorageClass
-	}()
-
-	globalStorageClass = storageclass.Config{}
-
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -345,13 +415,6 @@ func TestErasureDeleteObjectDiskNotFoundErasure4(t *testing.T) {
 }
 
 func TestErasureDeleteObjectDiskNotFoundErr(t *testing.T) {
-	restoreGlobalStorageClass := globalStorageClass
-	defer func() {
-		globalStorageClass = restoreGlobalStorageClass
-	}()
-
-	globalStorageClass = storageclass.Config{}
-
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -526,7 +589,6 @@ func TestGetObjectNoQuorum(t *testing.T) {
 			gr.Close()
 		}
 	}
-
 }
 
 func TestHeadObjectNoQuorum(t *testing.T) {
@@ -807,13 +869,6 @@ func TestObjectQuorumFromMeta(t *testing.T) {
 }
 
 func testObjectQuorumFromMeta(obj ObjectLayer, instanceType string, dirs []string, t TestErrHandler) {
-	restoreGlobalStorageClass := globalStorageClass
-	defer func() {
-		globalStorageClass = restoreGlobalStorageClass
-	}()
-
-	globalStorageClass = storageclass.Config{}
-
 	bucket := getRandomBucketName()
 
 	var opts ObjectOptions

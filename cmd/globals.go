@@ -23,12 +23,16 @@ import (
 	"net/http"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/minio/console/restapi"
 	"github.com/minio/minio-go/v7/pkg/set"
 	"github.com/minio/minio/internal/bucket/bandwidth"
+	"github.com/minio/minio/internal/config"
 	"github.com/minio/minio/internal/handlers"
 	"github.com/minio/minio/internal/kms"
+	"github.com/rs/dnscache"
 
 	"github.com/dustin/go-humanize"
 	"github.com/minio/minio/internal/auth"
@@ -37,8 +41,10 @@ import (
 	"github.com/minio/minio/internal/config/dns"
 	xldap "github.com/minio/minio/internal/config/identity/ldap"
 	"github.com/minio/minio/internal/config/identity/openid"
+	xtls "github.com/minio/minio/internal/config/identity/tls"
 	"github.com/minio/minio/internal/config/policy/opa"
 	"github.com/minio/minio/internal/config/storageclass"
+	"github.com/minio/minio/internal/config/subnet"
 	xhttp "github.com/minio/minio/internal/http"
 	etcd "go.etcd.io/etcd/client/v3"
 
@@ -88,14 +94,12 @@ const (
 	// date and server date during signature verification.
 	globalMaxSkewTime = 15 * time.Minute // 15 minutes skew allowed.
 
-	// GlobalStaleUploadsExpiry - Expiry duration after which the uploads in multipart, tmp directory are deemed stale.
+	// GlobalStaleUploadsExpiry - Expiry duration after which the uploads in multipart,
+	// tmp directory are deemed stale.
 	GlobalStaleUploadsExpiry = time.Hour * 24 // 24 hrs.
 
 	// GlobalStaleUploadsCleanupInterval - Cleanup interval when the stale uploads cleanup is initiated.
-	GlobalStaleUploadsCleanupInterval = time.Hour * 12 // 12 hrs.
-
-	// GlobalServiceExecutionInterval - Executes the Lifecycle events.
-	GlobalServiceExecutionInterval = time.Hour * 24 // 24 hrs.
+	GlobalStaleUploadsCleanupInterval = time.Hour * 6 // 6 hrs.
 
 	// Refresh interval to update in-memory iam config cache.
 	globalRefreshIAMInterval = 5 * time.Minute
@@ -114,6 +118,9 @@ const (
 
 	// diskMinInodes is the minimum number of inodes we want free on a disk to perform writes.
 	diskMinInodes = 1000
+
+	// tlsClientSessionCacheSize is the cache size for client sessions.
+	tlsClientSessionCacheSize = 100
 )
 
 var globalCLIContext = struct {
@@ -145,8 +152,9 @@ var (
 	// This flag is set to 'true' when MINIO_UPDATE env is set to 'off'. Default is false.
 	globalInplaceUpdateDisabled = false
 
-	// This flag is set to 'us-east-1' by default
-	globalServerRegion = globalMinioDefaultRegion
+	globalSite = config.Site{
+		Region: globalMinioDefaultRegion,
+	}
 
 	// MinIO local server address (in `host:port` format)
 	globalMinioAddr = ""
@@ -187,6 +195,7 @@ var (
 	globalStorageClass storageclass.Config
 	globalLDAPConfig   xldap.Config
 	globalOpenIDConfig openid.Config
+	globalSTSTLSConfig xtls.Config
 
 	// CA root certificates, a nil value means system certs pool will be used
 	globalRootCAs *x509.CertPool
@@ -215,6 +224,9 @@ var (
 
 	// The name of this local node, fetched from arguments
 	globalLocalNodeName string
+
+	// The global subnet config
+	globalSubnetConfig subnet.Config
 
 	globalRemoteEndpoints map[string]Endpoint
 
@@ -249,6 +261,9 @@ var (
 
 	// Allocated etcd endpoint for config and bucket DNS.
 	globalEtcdClient *etcd.Client
+
+	// Cluster replication manager.
+	globalSiteReplicationSys SiteReplicationSys
 
 	// Is set to true when Bucket federation is requested
 	// and is 'true' when etcdConfig.PathPrefix is empty
@@ -304,7 +319,9 @@ var (
 
 	globalProxyTransport http.RoundTripper
 
-	globalDNSCache *xhttp.DNSCache
+	globalDNSCache = &dnscache.Resolver{
+		Timeout: 5 * time.Second,
+	}
 
 	globalForwarder *handlers.Forwarder
 
@@ -312,7 +329,27 @@ var (
 
 	globalTierJournal *tierJournal
 
-	globalDebugRemoteTiersImmediately []string
+	globalConsoleSrv *restapi.Server
+
+	// handles service freeze or un-freeze S3 API calls.
+	globalServiceFreeze atomic.Value
+
+	// Only needed for tracking
+	globalServiceFreezeCnt int32
+	globalServiceFreezeMu  sync.Mutex // Updates.
+
+	// List of local drives to this node, this is only set during server startup.
+	globalLocalDrives []StorageAPI
+
+	// Is MINIO_CI_CD set?
+	globalIsCICD bool
+
+	globalRootDiskThreshold uint64
+
+	// Used for collecting stats for netperf
+	globalNetPerfMinDuration = time.Second * 10
+	globalNetPerfRX          netPerfRX
+
 	// Add new variable global values here.
 )
 

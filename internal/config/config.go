@@ -55,9 +55,14 @@ const (
 	EnableOn  = madmin.EnableOn
 	EnableOff = madmin.EnableOff
 
+	RegionKey  = "region"
+	NameKey    = "name"
 	RegionName = "name"
 	AccessKey  = "access_key"
 	SecretKey  = "secret_key"
+	License    = "license" // Deprecated Dec 2021
+	APIKey     = "api_key"
+	Proxy      = "proxy"
 )
 
 // Top level config constants.
@@ -66,7 +71,9 @@ const (
 	PolicyOPASubSys      = "policy_opa"
 	IdentityOpenIDSubSys = "identity_openid"
 	IdentityLDAPSubSys   = "identity_ldap"
+	IdentityTLSSubSys    = "identity_tls"
 	CacheSubSys          = "cache"
+	SiteSubSys           = "site"
 	RegionSubSys         = "region"
 	EtcdSubSys           = "etcd"
 	StorageClassSubSys   = "storage_class"
@@ -78,6 +85,7 @@ const (
 	HealSubSys           = "heal"
 	ScannerSubSys        = "scanner"
 	CrawlerSubSys        = "crawler"
+	SubnetSubSys         = "subnet"
 
 	// Add new constants here if you add new fields to config.
 )
@@ -98,9 +106,31 @@ const (
 	// Add new constants here if you add new fields to config.
 )
 
+// NotifySubSystems - all notification sub-systems
+var NotifySubSystems = set.CreateStringSet(
+	NotifyKafkaSubSys,
+	NotifyMQTTSubSys,
+	NotifyMySQLSubSys,
+	NotifyNATSSubSys,
+	NotifyNSQSubSys,
+	NotifyESSubSys,
+	NotifyAMQPSubSys,
+	NotifyPostgresSubSys,
+	NotifyRedisSubSys,
+	NotifyWebhookSubSys,
+)
+
+// LoggerSubSystems - all sub-systems related to logger
+var LoggerSubSystems = set.CreateStringSet(
+	LoggerWebhookSubSys,
+	AuditWebhookSubSys,
+	AuditKafkaSubSys,
+)
+
 // SubSystems - all supported sub-systems
 var SubSystems = set.CreateStringSet(
 	CredentialsSubSys,
+	SiteSubSys,
 	RegionSubSys,
 	EtcdSubSys,
 	CacheSubSys,
@@ -113,6 +143,7 @@ var SubSystems = set.CreateStringSet(
 	PolicyOPASubSys,
 	IdentityLDAPSubSys,
 	IdentityOpenIDSubSys,
+	IdentityTLSSubSys,
 	ScannerSubSys,
 	HealSubSys,
 	NotifyAMQPSubSys,
@@ -125,6 +156,7 @@ var SubSystems = set.CreateStringSet(
 	NotifyPostgresSubSys,
 	NotifyRedisSubSys,
 	NotifyWebhookSubSys,
+	SubnetSubSys,
 )
 
 // SubSystemsDynamic - all sub-systems that have dynamic config.
@@ -133,11 +165,16 @@ var SubSystemsDynamic = set.CreateStringSet(
 	CompressionSubSys,
 	ScannerSubSys,
 	HealSubSys,
+	SubnetSubSys,
+	LoggerWebhookSubSys,
+	AuditWebhookSubSys,
+	AuditKafkaSubSys,
 )
 
 // SubSystemsSingleTargets - subsystems which only support single target.
 var SubSystemsSingleTargets = set.CreateStringSet([]string{
 	CredentialsSubSys,
+	SiteSubSys,
 	RegionSubSys,
 	EtcdSubSys,
 	CacheSubSys,
@@ -147,6 +184,7 @@ var SubSystemsSingleTargets = set.CreateStringSet([]string{
 	PolicyOPASubSys,
 	IdentityLDAPSubSys,
 	IdentityOpenIDSubSys,
+	IdentityTLSSubSys,
 	HealSubSys,
 	ScannerSubSys,
 }...)
@@ -195,6 +233,19 @@ func RegisterHelpSubSys(helpKVSMap map[string]HelpKVS) {
 	}
 }
 
+// HelpDeprecatedSubSysMap - help for all deprecated sub-systems, that may be
+// removed in the future.
+var HelpDeprecatedSubSysMap map[string]HelpKV
+
+// RegisterHelpDeprecatedSubSys - saves input help KVS for deprecated
+// sub-systems globally. Should be called only once at init.
+func RegisterHelpDeprecatedSubSys(helpDeprecatedKVMap map[string]HelpKV) {
+	HelpDeprecatedSubSysMap = map[string]HelpKV{}
+	for k, v := range helpDeprecatedKVMap {
+		HelpDeprecatedSubSysMap[k] = v
+	}
+}
+
 // KV - is a shorthand of each key value.
 type KV struct {
 	Key   string `json:"key"`
@@ -210,9 +261,23 @@ func (kvs KVS) Empty() bool {
 	return len(kvs) == 0
 }
 
+// Clone - returns a copy of the KVS
+func (kvs KVS) Clone() KVS {
+	return append(make(KVS, 0, len(kvs)), kvs...)
+}
+
+// GetWithDefault - returns default value if key not set
+func (kvs KVS) GetWithDefault(key string, defaultKVS KVS) string {
+	v := kvs.Get(key)
+	if len(v) == 0 {
+		return defaultKVS.Get(key)
+	}
+	return v
+}
+
 // Keys returns the list of keys for the current KVS
 func (kvs KVS) Keys() []string {
-	var keys = make([]string, len(kvs))
+	keys := make([]string, len(kvs))
 	var foundComment bool
 	for i := range kvs {
 		if kvs[i].Key == madmin.CommentKey {
@@ -428,6 +493,17 @@ var (
 		},
 	}
 
+	DefaultSiteKVS = KVS{
+		KV{
+			Key:   NameKey,
+			Value: "",
+		},
+		KV{
+			Key:   RegionKey,
+			Value: "",
+		},
+	}
+
 	DefaultRegionKVS = KVS{
 		KV{
 			Key:   RegionName,
@@ -450,26 +526,66 @@ func LookupCreds(kv KVS) (auth.Credentials, error) {
 	return auth.CreateCredentials(accessKey, secretKey)
 }
 
+// Site - holds site info - name and region.
+type Site struct {
+	Name   string
+	Region string
+}
+
 var validRegionRegex = regexp.MustCompile("^[a-zA-Z][a-zA-Z0-9-_-]+$")
 
-// LookupRegion - get current region.
-func LookupRegion(kv KVS) (string, error) {
-	if err := CheckValidKeys(RegionSubSys, kv, DefaultRegionKVS); err != nil {
-		return "", err
+// validSiteNameRegex - allows lowercase letters, digits and '-', starts with
+// letter. At least 2 characters long.
+var validSiteNameRegex = regexp.MustCompile("^[a-z][a-z0-9-]+$")
+
+// LookupSite - get site related configuration. Loads configuration from legacy
+// region sub-system as well.
+func LookupSite(siteKV KVS, regionKV KVS) (s Site, err error) {
+	if err = CheckValidKeys(SiteSubSys, siteKV, DefaultSiteKVS); err != nil {
+		return
 	}
 	region := env.Get(EnvRegion, "")
 	if region == "" {
-		region = env.Get(EnvRegionName, kv.Get(RegionName))
+		env.Get(EnvRegionName, "")
+	}
+	if region == "" {
+		region = env.Get(EnvSiteRegion, siteKV.Get(RegionKey))
+	}
+	if region == "" {
+		// No region config found in the site-subsystem. So lookup the legacy
+		// region sub-system.
+		if err = CheckValidKeys(RegionSubSys, regionKV, DefaultRegionKVS); err != nil {
+			// An invalid key was found in the region sub-system.
+			// Since the region sub-system cannot be (re)set as it
+			// is legacy, we return an error to tell the user to
+			// reset the region via the new command.
+			err = Errorf("could not load region from legacy configuration as it was invalid - use 'mc admin config set myminio site region=myregion name=myname' to set a region and name (%v)", err)
+			return
+		}
+
+		region = regionKV.Get(RegionName)
 	}
 	if region != "" {
-		if validRegionRegex.MatchString(region) {
-			return region, nil
+		if !validRegionRegex.MatchString(region) {
+			err = Errorf(
+				"region '%s' is invalid, expected simple characters such as [us-east-1, myregion...]",
+				region)
+			return
 		}
-		return "", Errorf(
-			"region '%s' is invalid, expected simple characters such as [us-east-1, myregion...]",
-			region)
+		s.Region = region
 	}
-	return "", nil
+
+	name := env.Get(EnvSiteName, siteKV.Get(NameKey))
+	if name != "" {
+		if !validSiteNameRegex.MatchString(name) {
+			err = Errorf(
+				"site name '%s' is invalid, expected simple characters such as [cal-rack0, myname...]",
+				name)
+			return
+		}
+		s.Name = name
+	}
+	return
 }
 
 // CheckValidKeys - checks if inputs KVS has the necessary keys,
@@ -605,9 +721,14 @@ func (c Config) GetKVS(s string, defaultKVS map[string]KVS) (Targets, error) {
 			KVS:       kvs,
 		})
 	} else {
-		hkvs := HelpSubSysMap[""]
-		// Use help for sub-system to preserve the order.
-		for _, hkv := range hkvs {
+		// Use help for sub-system to preserve the order. Add deprecated
+		// keys at the end (in some order).
+		kvsOrder := append([]HelpKV{}, HelpSubSysMap[""]...)
+		for _, v := range HelpDeprecatedSubSysMap {
+			kvsOrder = append(kvsOrder, v)
+		}
+
+		for _, hkv := range kvsOrder {
 			if !strings.HasPrefix(hkv.Key, subSysPrefix) {
 				continue
 			}
@@ -687,41 +808,50 @@ func (c Config) Clone() Config {
 	return cp
 }
 
-// SetKVS - set specific key values per sub-system.
-func (c Config) SetKVS(s string, defaultKVS map[string]KVS) (dynamic bool, err error) {
+// GetSubSys - extracts subssystem info from given config string
+func GetSubSys(s string) (subSys string, inputs []string, tgt string, e error) {
+	tgt = Default
 	if len(s) == 0 {
-		return false, Errorf("input arguments cannot be empty")
+		return subSys, inputs, tgt, Errorf("input arguments cannot be empty")
 	}
-	inputs := strings.SplitN(s, KvSpaceSeparator, 2)
-	if len(inputs) <= 1 {
-		return false, Errorf("invalid number of arguments '%s'", s)
-	}
+	inputs = strings.SplitN(s, KvSpaceSeparator, 2)
+
 	subSystemValue := strings.SplitN(inputs[0], SubSystemSeparator, 2)
-	if len(subSystemValue) == 0 {
-		return false, Errorf("invalid number of arguments %s", s)
+	subSys = subSystemValue[0]
+	if !SubSystems.Contains(subSys) {
+		return subSys, inputs, tgt, Errorf("unknown sub-system %s", s)
 	}
 
-	if !SubSystems.Contains(subSystemValue[0]) {
-		return false, Errorf("unknown sub-system %s", s)
+	if len(inputs) == 1 {
+		return subSys, inputs, tgt, nil
 	}
 
 	if SubSystemsSingleTargets.Contains(subSystemValue[0]) && len(subSystemValue) == 2 {
-		return false, Errorf("sub-system '%s' only supports single target", subSystemValue[0])
+		return subSys, inputs, tgt, Errorf("sub-system '%s' only supports single target", subSystemValue[0])
 	}
-	dynamic = SubSystemsDynamic.Contains(subSystemValue[0])
 
-	tgt := Default
-	subSys := subSystemValue[0]
 	if len(subSystemValue) == 2 {
 		tgt = subSystemValue[1]
 	}
+
+	return subSys, inputs, tgt, e
+}
+
+// SetKVS - set specific key values per sub-system.
+func (c Config) SetKVS(s string, defaultKVS map[string]KVS) (dynamic bool, err error) {
+	subSys, inputs, tgt, err := GetSubSys(s)
+	if err != nil {
+		return false, err
+	}
+
+	dynamic = SubSystemsDynamic.Contains(subSys)
 
 	fields := madmin.KvFields(inputs[1], defaultKVS[subSys].Keys())
 	if len(fields) == 0 {
 		return false, Errorf("sub-system '%s' cannot have empty keys", subSys)
 	}
 
-	var kvs = KVS{}
+	kvs := KVS{}
 	var prevK string
 	for _, v := range fields {
 		kv := strings.SplitN(v, KvSeparator, 2)
@@ -752,10 +882,12 @@ func (c Config) SetKVS(s string, defaultKVS map[string]KVS) (dynamic bool, err e
 		kvs.Set(Enable, EnableOn)
 	}
 
-	currKVS, ok := c[subSys][tgt]
+	var currKVS KVS
+	ck, ok := c[subSys][tgt]
 	if !ok {
-		currKVS = defaultKVS[subSys]
+		currKVS = defaultKVS[subSys].Clone()
 	} else {
+		currKVS = ck.Clone()
 		for _, kv := range defaultKVS[subSys] {
 			if _, ok = currKVS.Lookup(kv.Key); !ok {
 				currKVS.Set(kv.Key, kv.Value)
